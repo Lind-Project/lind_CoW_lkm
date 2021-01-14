@@ -44,7 +44,7 @@ static void do_register_kprobe(struct kprobe *kp, char *symbol_name, void* handl
   register_kprobe(kp);
 }
 void lookup_lookup_name(void) {
-  static struct kprobe kp0, kp1;
+  struct kprobe kp0, kp1;
   do_register_kprobe(&kp0, "kallsyms_lookup_name", pre0);
   do_register_kprobe(&kp1, "kallsyms_lookup_name", pre1);
   unregister_kprobe(&kp0);
@@ -57,9 +57,11 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
   pid_t pid = regs->di;
   const __user struct iovec *local_iov = (struct iovec*) regs->si;
   unsigned long liovcnt = regs->dx;
+  struct iovec *local_iov_kern = kmalloc(sizeof(struct iovec), liovcnt);
   const __user struct iovec *remote_iov = (struct iovec*) regs->r10;
   unsigned long riovcnt = regs->r8;
-  struct task_struct* local_task = kmalloc(sizeof(struct task_struct), 1);
+  struct iovec *remote_iov_kern = kmalloc(sizeof(struct iovec), riovcnt);
+  struct task_struct* local_task = current;
   struct task_struct* remote_task;
   ssize_t copied_count = 0;
   int i;
@@ -72,16 +74,18 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
   if(liovcnt != riovcnt) {
     goto cow_pre_einval;
   }
+
+  copy_from_user(local_iov_kern, local_iov, liovcnt * sizeof(struct iovec));
+  copy_from_user(remote_iov_kern, remote_iov, riovcnt * sizeof(struct iovec));
   
-  get_task_struct(local_task);
   remote_task = pid_task(find_vpid(pid), PIDTYPE_PID);
   for(i = 0; i < liovcnt; i++) {
-    if(local_iov[i].iov_len != remote_iov[i].iov_len)
+    if(local_iov_kern[i].iov_len != remote_iov_kern[i].iov_len)
       goto cow_pre_einval;
-    if(find_vma_intersection(remote_task->mm, (unsigned long) remote_iov[i].iov_base, 
-	       (unsigned long) (remote_iov[i].iov_base + remote_iov[i].iov_len)) || 
-       !find_exact_vma(local_task->mm, (unsigned long) local_iov[i].iov_base, 
-	       (unsigned long) (local_iov[i].iov_base + local_iov[i].iov_len)))
+    if(find_vma_intersection(remote_task->mm, (unsigned long) remote_iov_kern[i].iov_base, 
+	       (unsigned long) (remote_iov_kern[i].iov_base + remote_iov_kern[i].iov_len)) || 
+       !find_exact_vma(local_task->mm, (unsigned long) local_iov_kern[i].iov_base, 
+	       (unsigned long) (local_iov_kern[i].iov_base + local_iov_kern[i].iov_len)))
       goto cow_pre_efault;
   }
   //There may be deadlock potential here
@@ -91,10 +95,10 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
   }
   for(i = 0; i < liovcnt; i++) {
     bool need_rmap_locks;
-    struct vm_area_struct *lvma = find_exact_vma(local_task->mm, (unsigned long) local_iov[i].iov_base, 
-		    (unsigned long) (local_iov[i].iov_base + local_iov[i].iov_len));
-    unsigned long pgoff = (unsigned long) remote_iov[i].iov_base >> PAGE_SHIFT;
-    struct vm_area_struct *rvma = cvma(&lvma, (unsigned long) remote_iov[i].iov_base, local_iov[i].iov_len, pgoff, &need_rmap_locks);
+    struct vm_area_struct *lvma = find_exact_vma(local_task->mm, (unsigned long) local_iov_kern[i].iov_base, 
+		    (unsigned long) (local_iov_kern[i].iov_base + local_iov_kern[i].iov_len));
+    unsigned long pgoff = (unsigned long) remote_iov_kern[i].iov_base >> PAGE_SHIFT;
+    struct vm_area_struct *rvma = cvma(&lvma, (unsigned long) remote_iov_kern[i].iov_base, local_iov_kern[i].iov_len, pgoff, &need_rmap_locks);
     struct file *file;
     if(!rvma)
       goto cow_enomem;
@@ -128,13 +132,14 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
     if(retval) ;//TODO: error out in some not braindead way
     retval = ivs(remote_task->mm, rvma);
     if(retval) ;//TODO: error out in some not braindead way
-    copied_count += local_iov[i].iov_len;
+    copied_count += local_iov_kern[i].iov_len;
   }
   mmap_write_unlock(remote_task->mm);
   if(local_task->mm != remote_task->mm) {
     mmap_write_unlock(local_task->mm);
   }
-  kfree(local_task);
+  kfree(local_iov_kern);
+  kfree(remote_iov_kern);
   if(copied_count == 0) return -1;//TODO: error better here?
   return copied_count;
   cow_enomem:
@@ -142,13 +147,16 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
   if(local_task->mm == remote_task->mm) {
     mmap_write_unlock(local_task->mm);
   }
-  kfree(local_task);
+  kfree(local_iov_kern);
+  kfree(remote_iov_kern);
   return -ENOMEM;
   cow_pre_einval:
-  kfree(local_task);
+  kfree(local_iov_kern);
+  kfree(remote_iov_kern);
   return -EINVAL;
   cow_pre_efault:
-  kfree(local_task);
+  kfree(local_iov_kern);
+  kfree(remote_iov_kern);
   return -EFAULT;
 }
 
