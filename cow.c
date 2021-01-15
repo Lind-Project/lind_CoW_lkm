@@ -87,13 +87,14 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
       goto cow_pre_efault;
     }
   }
-  //There may be deadlock potential here
+  //Any attempt to lock here (required by copy_page_range) causes deadlock and I don't know why
   mmap_write_lock_nested(remote_task->mm, SINGLE_DEPTH_NESTING);
   for(i = 0; i < liovcnt; i++) {
     bool need_rmap_locks;
     struct vm_area_struct *lvma = find_exact_vma(local_task->mm, (unsigned long) local_iov_kern[i].iov_base, 
 		    (unsigned long) (local_iov_kern[i].iov_base + local_iov_kern[i].iov_len));
     unsigned long pgoff = (unsigned long) remote_iov_kern[i].iov_base >> PAGE_SHIFT;
+    //Note: BIG BUG! It links it into the wrong vm_mm!! This is likely to make everything not work
     struct vm_area_struct *rvma = cvma(&lvma, (unsigned long) remote_iov_kern[i].iov_base, local_iov_kern[i].iov_len, pgoff, &need_rmap_locks);
     struct file *file;
     if(!rvma)
