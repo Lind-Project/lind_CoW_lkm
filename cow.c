@@ -24,7 +24,6 @@ unsigned long* syscall_table;
 void (*rvhp)(void*);
 int (*cpr)(void*, void*);
 int (*avf)(void*, void*);
-void* (*vmd)(void*);
 int (*ivs)(void*, void*);
 void* (*cvma)(void*, unsigned long, unsigned long, pgoff_t, void*);
 ssize_t (*old_vm_writev)(const struct pt_regs *);
@@ -68,9 +67,6 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
   //ignore flags
   //TODO: ERSCH and EPERM support
 
-  if(!local_task) {
-    return -ENOMEM;
-  }
   if(liovcnt != riovcnt) {
     goto cow_pre_einval;
   }
@@ -92,10 +88,7 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
     }
   }
   //There may be deadlock potential here
-  //mmap_write_lock_nested(remote_task->mm, SINGLE_DEPTH_NESTING);
-  //if(local_task->mm != remote_task->mm) {
-  //  mmap_write_lock_nested(local_task->mm, SINGLE_DEPTH_NESTING);
-  //} //don't lock for now
+  mmap_write_lock_nested(remote_task->mm, SINGLE_DEPTH_NESTING);
   for(i = 0; i < liovcnt; i++) {
     bool need_rmap_locks;
     struct vm_area_struct *lvma = find_exact_vma(local_task->mm, (unsigned long) local_iov_kern[i].iov_base, 
@@ -130,7 +123,7 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
       rvhp(rvma);
     printk(KERN_INFO "LINDLKM: hugetlb check finished\n");
     if(!(rvma->vm_flags & VM_WIPEONFORK)) {
-      printk(KERN_INFO "LINDLKM: %p %p \n", rvma->vm_mm, lvma->vm_mm);
+      printk(KERN_INFO "LINDLKM: %p %p \n", rvma, lvma);
       retval = cpr(rvma, lvma);
     }
     if(rvma->vm_ops && rvma->vm_ops->open)
@@ -143,19 +136,13 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
     copied_count += local_iov_kern[i].iov_len;
     printk(KERN_INFO "looped right?\n");
   }
-  //mmap_write_unlock(remote_task->mm);
-  //if(local_task->mm != remote_task->mm) {
-  //  mmap_write_unlock(local_task->mm);
-  //}
+  mmap_write_unlock(remote_task->mm);
   kfree(local_iov_kern);
   kfree(remote_iov_kern);
   if(copied_count == 0) return -1;//TODO: error better here?
   return copied_count;
   cow_enomem:
-  //mmap_write_unlock(remote_task->mm);
-  if(local_task->mm == remote_task->mm) {
-    //mmap_write_unlock(local_task->mm);
-  }
+  mmap_write_unlock(remote_task->mm);
   kfree(local_iov_kern);
   kfree(remote_iov_kern);
   return -ENOMEM;
@@ -215,7 +202,6 @@ static int __init cowcall_init(void) {
   rvhp = (void(*)(void*)) kln("reset_vma_resv_huge_pages");
   cpr = (int(*)(void*, void*)) kln("copy_page_range");
   avf = (int(*)(void*, void*)) kln("anon_vma_fork");
-  vmd = (void*(*)(void*)) kln("vm_area_dup");
   ivs = (int(*)(void*, void*)) kln("insert_vm_struct");
   cvma = (void* (*)(void*, unsigned long, unsigned long, pgoff_t, void*)) kln("copy_vma");
   vitia = (void (*)(void*, void*, void*))kln("vma_interval_tree_insert_after");
