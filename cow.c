@@ -83,16 +83,19 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
     if(local_iov_kern[i].iov_len != remote_iov_kern[i].iov_len)
       goto cow_pre_einval;
     if(find_vma_intersection(remote_task->mm, (unsigned long) remote_iov_kern[i].iov_base, 
-	       (unsigned long) (remote_iov_kern[i].iov_base + remote_iov_kern[i].iov_len)) || 
-       !find_exact_vma(local_task->mm, (unsigned long) local_iov_kern[i].iov_base, 
-	       (unsigned long) (local_iov_kern[i].iov_base + local_iov_kern[i].iov_len)))
+	       (unsigned long) (remote_iov_kern[i].iov_base + remote_iov_kern[i].iov_len))) {
       goto cow_pre_efault;
+    }
+    if(!find_exact_vma(local_task->mm, (unsigned long) local_iov_kern[i].iov_base, 
+            (unsigned long) (local_iov_kern[i].iov_base + local_iov_kern[i].iov_len))) {
+      goto cow_pre_efault;
+    }
   }
   //There may be deadlock potential here
-  mmap_write_lock_nested(remote_task->mm, SINGLE_DEPTH_NESTING);
-  if(local_task->mm != remote_task->mm) {
-    mmap_write_lock_nested(local_task->mm, SINGLE_DEPTH_NESTING);
-  }
+  //mmap_write_lock_nested(remote_task->mm, SINGLE_DEPTH_NESTING);
+  //if(local_task->mm != remote_task->mm) {
+  //  mmap_write_lock_nested(local_task->mm, SINGLE_DEPTH_NESTING);
+  //} //don't lock for now
   for(i = 0; i < liovcnt; i++) {
     bool need_rmap_locks;
     struct vm_area_struct *lvma = find_exact_vma(local_task->mm, (unsigned long) local_iov_kern[i].iov_base, 
@@ -115,37 +118,43 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
       get_file(file);
       if(rvma->vm_flags & VM_DENYWRITE)
         atomic_dec(&inode->i_writecount);
-      i_mmap_lock_write(mapping);
+      //i_mmap_lock_write(mapping);
       if(rvma->vm_flags & VM_SHARED)
         atomic_dec(&mapping->i_mmap_writable);
-      flush_dcache_mmap_lock(mapping);
+      //flush_dcache_mmap_lock(mapping);
       vitia(rvma, lvma, &mapping->i_mmap);
       flush_dcache_mmap_unlock(mapping);
-      i_mmap_unlock_write(mapping);
+      //i_mmap_unlock_write(mapping);
     }
     if(is_vm_hugetlb_page(rvma))
       rvhp(rvma);
-    if(!(rvma->vm_flags & VM_WIPEONFORK))
-      retval = cpr(lvma, rvma);
+    printk(KERN_INFO "LINDLKM: hugetlb check finished\n");
+    if(!(rvma->vm_flags & VM_WIPEONFORK)) {
+      printk(KERN_INFO "LINDLKM: %p %p \n", rvma->vm_mm, lvma->vm_mm);
+      retval = cpr(rvma, lvma);
+    }
     if(rvma->vm_ops && rvma->vm_ops->open)
       rvma->vm_ops->open(rvma);
     if(retval) ;//TODO: error out in some not braindead way
+    printk(KERN_INFO "LINDLKM: something I don't understand finished\n");
     retval = ivs(remote_task->mm, rvma);
     if(retval) ;//TODO: error out in some not braindead way
+    printk(KERN_INFO "LINDLKM: something happened??\n");
     copied_count += local_iov_kern[i].iov_len;
+    printk(KERN_INFO "looped right?\n");
   }
-  mmap_write_unlock(remote_task->mm);
-  if(local_task->mm != remote_task->mm) {
-    mmap_write_unlock(local_task->mm);
-  }
+  //mmap_write_unlock(remote_task->mm);
+  //if(local_task->mm != remote_task->mm) {
+  //  mmap_write_unlock(local_task->mm);
+  //}
   kfree(local_iov_kern);
   kfree(remote_iov_kern);
   if(copied_count == 0) return -1;//TODO: error better here?
   return copied_count;
   cow_enomem:
-  mmap_write_unlock(remote_task->mm);
+  //mmap_write_unlock(remote_task->mm);
   if(local_task->mm == remote_task->mm) {
-    mmap_write_unlock(local_task->mm);
+    //mmap_write_unlock(local_task->mm);
   }
   kfree(local_iov_kern);
   kfree(remote_iov_kern);
