@@ -11,6 +11,8 @@
 #include <linux/hugetlb.h>
 #include <linux/mm.h>
 #include <linux/kprobes.h>
+#include <linux/mmu_notifier.h>
+#include <asm/tlbflush.h>
 #include <asm/uaccess.h>
 
 MODULE_LICENSE("GPL");
@@ -18,16 +20,18 @@ MODULE_AUTHOR("Jonathan Singer");
 MODULE_DESCRIPTION("A LKM that allows for user-space CoW functionality");
 MODULE_VERSION("0.1");
 
+
 void* klnaddr;
 unsigned long (*kln)(const char* name);
 unsigned long* syscall_table;
 void (*rvhp)(void*);
-int (*cpr)(void*, void*);
 int (*avf)(void*, void*);
 int (*ivs)(void*, void*);
 void* (*cvma)(void*, unsigned long, unsigned long, pgoff_t, void*);
 ssize_t (*old_vm_writev)(const struct pt_regs *);
 void (*vitia)(void*, void*, void*);
+int (*cp4dr)(void*, void*, void*, void*, unsigned long, unsigned long);
+void (*ftmr)(void*, unsigned long, unsigned long, int, bool);
 
 //Get address of kallsyms_lookup_name, from https://github.com/zizzu0/LinuxKernelModules
 static int __kprobes pre0(struct kprobe *p, struct pt_regs *regs) {
@@ -51,6 +55,61 @@ void lookup_lookup_name(void) {
   kln = (unsigned long(*)(const char*))klnaddr;
 }
 
+int custom_copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma) {
+  pgd_t *src_pgd, *dst_pgd;
+  unsigned long srcnext;
+  unsigned long dstnext;
+  unsigned long srcaddr = src_vma->vm_start;
+  unsigned long srcend = src_vma->vm_end;
+  unsigned long dstaddr = dst_vma->vm_start;
+  unsigned long dstend = dst_vma->vm_end;
+  struct mm_struct *dst_mm = dst_vma->vm_mm;
+  struct mm_struct *src_mm = src_vma->vm_mm;
+  bool is_cow;
+  int ret;
+  if(!(src_vma->vm_flags & (VM_HUGETLB | VM_PFNMAP | VM_MIXEDMAP)) && !src_vma->anon_vma)
+    return 0;
+  if(is_vm_hugetlb_page(src_vma))
+    return 0; //we don't handle hugetlb pages yet
+  if(unlikely(src_vma->vm_flags & VM_PFNMAP))
+    return 0; //we don't handle pure page regions
+
+  is_cow = (src_vma->vm_flags & (VM_SHARED | VM_MAYWRITE)) == VM_MAYWRITE;
+  if(is_cow) {
+    //I am currently unsure, but I believe this ought to be done to the destination locations?
+    mmap_write_lock(src_mm);
+    raw_write_seqcount_begin(&src_mm->write_protect_seq);
+    mmap_write_unlock(src_mm);
+  }
+
+  printk(KERN_INFO "LINDLKM: initial iscow garbage\n");
+  ret = 0;
+  dst_pgd = pgd_offset(dst_mm, dstaddr);
+  src_pgd = pgd_offset(src_mm, srcaddr);
+  printk(KERN_INFO "LINDLKM: offsets calculated\n");
+
+  do {
+    srcnext = pgd_addr_end(srcaddr, srcend);
+    dstnext = pgd_addr_end(dstaddr, dstend);
+    printk(KERN_INFO "LINDLKM: addr_end calculated\n");
+    if(pgd_none(*src_pgd) || pgd_bad(*src_pgd)) continue; //probably we should clear bad?
+    //likely we'll need to figure out copy_p4d_range as well
+    if(cp4dr(dst_vma, src_vma, dst_pgd, src_pgd, dstaddr, dstnext)) {
+      ret = -ENOMEM;
+      break;
+    }
+    printk(KERN_INFO "LINDLKM: did erroneous copy?\n");
+  } while (dst_pgd++, src_pgd++, srcaddr = srcnext, dstaddr = dstnext, srcaddr != srcend);
+  if(is_cow) {
+    raw_write_seqcount_end(&src_mm->write_protect_seq);
+    printk(KERN_INFO "LINDLKM: does it die on ftmr?\n");
+    ftmr(src_vma->vm_mm, src_vma->vm_start, src_vma->vm_end, PAGE_SHIFT, false);
+    //flushing cache range would be a no-op on x86
+  }
+  printk(KERN_INFO "LINDLKM: final iscow garbage\n");
+  return ret;
+}
+
 ssize_t process_vm_cowv(const struct pt_regs *regs) {
   int retval;
   pid_t pid = regs->di;
@@ -71,10 +130,12 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
     goto cow_pre_einval;
   }
 
-  copy_from_user(local_iov_kern, local_iov, liovcnt * sizeof(struct iovec));
-  copy_from_user(remote_iov_kern, remote_iov, riovcnt * sizeof(struct iovec));
+  printk(KERN_INFO "LINDLKM: copying from user\n");
+  retval =  copy_from_user(local_iov_kern, local_iov, liovcnt * sizeof(struct iovec));
+  retval = copy_from_user(remote_iov_kern, remote_iov, riovcnt * sizeof(struct iovec));
   
   remote_task = pid_task(find_vpid(pid), PIDTYPE_PID);
+  printk(KERN_INFO "LINDLKM: got task\n");
   for(i = 0; i < liovcnt; i++) {
     if(local_iov_kern[i].iov_len != remote_iov_kern[i].iov_len)
       goto cow_pre_einval;
@@ -87,8 +148,8 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
       goto cow_pre_efault;
     }
   }
+  printk(KERN_INFO "LINDLKM: got iovs\n");
   //Any attempt to lock here (required by copy_page_range) causes deadlock and I don't know why
-  mmap_write_lock_nested(remote_task->mm, SINGLE_DEPTH_NESTING);
   for(i = 0; i < liovcnt; i++) {
     bool need_rmap_locks;
     struct vm_area_struct *lvma = find_exact_vma(local_task->mm, (unsigned long) local_iov_kern[i].iov_base, 
@@ -106,6 +167,7 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
       goto cow_enomem;
     rvma->vm_flags &= ~(VM_LOCKED | VM_LOCKONFAULT);
     file = rvma->vm_file;
+    printk(KERN_INFO "LINDLKM: not file backed\n");
     if(file) {
       struct inode *inode = file_inode(file);
       struct address_space *mapping = file->f_mapping;
@@ -120,12 +182,14 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
       flush_dcache_mmap_unlock(mapping);
       //i_mmap_unlock_write(mapping);
     }
+    printk(KERN_INFO "LINDLKM: huge page\n");
     if(is_vm_hugetlb_page(rvma))
       rvhp(rvma);
     printk(KERN_INFO "LINDLKM: hugetlb check finished\n");
     if(!(rvma->vm_flags & VM_WIPEONFORK)) {
       printk(KERN_INFO "LINDLKM: %p %p \n", rvma, lvma);
-      retval = cpr(rvma, lvma);
+      //copy page range custom
+      retval = custom_copy_page_range(rvma, lvma);
     }
     if(rvma->vm_ops && rvma->vm_ops->open)
       rvma->vm_ops->open(rvma);
@@ -137,13 +201,11 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
     copied_count += local_iov_kern[i].iov_len;
     printk(KERN_INFO "looped right?\n");
   }
-  mmap_write_unlock(remote_task->mm);
   kfree(local_iov_kern);
   kfree(remote_iov_kern);
   if(copied_count == 0) return -1;//TODO: error better here?
   return copied_count;
   cow_enomem:
-  mmap_write_unlock(remote_task->mm);
   kfree(local_iov_kern);
   kfree(remote_iov_kern);
   return -ENOMEM;
@@ -201,11 +263,12 @@ static int __init cowcall_init(void) {
   disable_syscall_write();
   printk(KERN_INFO "LINDLKM: Old vm writev at %p\n", old_vm_writev);
   rvhp = (void(*)(void*)) kln("reset_vma_resv_huge_pages");
-  cpr = (int(*)(void*, void*)) kln("copy_page_range");
   avf = (int(*)(void*, void*)) kln("anon_vma_fork");
   ivs = (int(*)(void*, void*)) kln("insert_vm_struct");
   cvma = (void* (*)(void*, unsigned long, unsigned long, pgoff_t, void*)) kln("copy_vma");
   vitia = (void (*)(void*, void*, void*))kln("vma_interval_tree_insert_after");
+  cp4dr = (int (*)(void*, void*, void*, void*, unsigned long, unsigned long)) kln("copy_p4d_range");
+  ftmr = (void (*)(void*, unsigned long, unsigned long, int, bool)) kln("flush_tlb_mm_range");
   return 0;
 }
 
