@@ -20,6 +20,8 @@ MODULE_AUTHOR("Jonathan Singer");
 MODULE_DESCRIPTION("A LKM that allows for user-space CoW functionality");
 MODULE_VERSION("0.1");
 
+#define p4dalloc(a, b, c) (unlikely(pgd_none(*(b)) && p4da((a), (b), (c))) ? NULL : p4d_offset((b), (c)))
+#define pudalloc(a, b, c) (unlikely(p4d_none(*(b)) && puda((a), (b), (c))) ? NULL : pud_offset((b), (c)))
 
 void* klnaddr;
 unsigned long (*kln)(const char* name);
@@ -30,8 +32,9 @@ int (*ivs)(void*, void*);
 void* (*cvma)(void*, unsigned long, unsigned long, pgoff_t, void*);
 ssize_t (*old_vm_writev)(const struct pt_regs *);
 void (*vitia)(void*, void*, void*);
-int (*cp4dr)(void*, void*, void*, void*, unsigned long, unsigned long);
 void (*ftmr)(void*, unsigned long, unsigned long, int, bool);
+p4d_t *(*p4da)(void*, void*, unsigned long);
+pud_t *(*puda)(void*, void*, unsigned long);
 
 //Get address of kallsyms_lookup_name, from https://github.com/zizzu0/LinuxKernelModules
 static int __kprobes pre0(struct kprobe *p, struct pt_regs *regs) {
@@ -67,6 +70,10 @@ int custom_copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct
   struct mm_struct *src_mm = src_vma->vm_mm;
   bool is_cow;
   int ret;
+  p4d_t *src_p4d, *dst_p4d;
+  pud_t *src_pud, *dst_pud;
+  unsigned long p4d_dst_next, p4d_src_next;
+  unsigned long pud_dst_next, pud_src_next;
   if(!(src_vma->vm_flags & (VM_HUGETLB | VM_PFNMAP | VM_MIXEDMAP)) && !src_vma->anon_vma)
     return 0;
   if(is_vm_hugetlb_page(src_vma))
@@ -91,14 +98,30 @@ int custom_copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct
   do {
     srcnext = pgd_addr_end(srcaddr, srcend);
     dstnext = pgd_addr_end(dstaddr, dstend);
-    printk(KERN_INFO "LINDLKM: addr_end calculated\n");
     if(pgd_none(*src_pgd) || pgd_bad(*src_pgd)) continue; //probably we should clear bad?
-    //likely we'll need to figure out copy_p4d_range as well
-    if(cp4dr(dst_vma, src_vma, dst_pgd, src_pgd, dstaddr, dstnext)) {
-      ret = -ENOMEM;
-      break;
-    }
-    printk(KERN_INFO "LINDLKM: did erroneous copy?\n");
+
+    printk(KERN_INFO "LINDLKM: p4d details %p %p %lu\n", dst_mm, dst_pgd, dstaddr);
+    dst_p4d = p4dalloc(dst_mm, dst_pgd, dstaddr);
+    if(!dst_p4d) break; //error out better
+    src_p4d = p4d_offset(src_pgd, srcaddr);
+    do {
+      p4d_src_next = p4d_addr_end(srcaddr, srcnext);
+      p4d_dst_next = p4d_addr_end(dstaddr, dstnext);
+      if(p4d_none(*src_p4d) || p4d_bad(*src_p4d)) continue;
+
+      dst_pud = pudalloc(dst_mm, dst_p4d, dstaddr);
+      if(!dst_pud) break; //error out better
+      src_pud = pud_offset(src_p4d, srcaddr);
+      printk(KERN_INFO "LINDLKM: pud did it\n");
+      do {
+        pud_src_next = pud_addr_end(srcaddr, p4d_src_next);
+        pud_dst_next = pud_addr_end(dstaddr, p4d_dst_next);
+	if(pud_trans_huge(*src_pud) || pud_devmap(*src_pud)) break; //error out better, we don't support hugetlb pages
+	if(pud_none(*src_pud) || pud_bad(*src_pud)) continue;
+	//copy_pmd_range then long copy_pte_range and we're out of this hell
+      } while(dst_pud++, src_pud++, srcaddr = pud_src_next, dstaddr = pud_dst_next, srcaddr != p4d_src_next);
+    } while(dst_p4d++, src_p4d++, srcaddr = p4d_src_next, dstaddr = p4d_dst_next, srcaddr != srcnext);
+    printk(KERN_INFO "LINDLKM: did stupid copy?\n");
   } while (dst_pgd++, src_pgd++, srcaddr = srcnext, dstaddr = dstnext, srcaddr != srcend);
   if(is_cow) {
     raw_write_seqcount_end(&src_mm->write_protect_seq);
@@ -131,7 +154,7 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
   }
 
   printk(KERN_INFO "LINDLKM: copying from user\n");
-  retval =  copy_from_user(local_iov_kern, local_iov, liovcnt * sizeof(struct iovec));
+  retval = copy_from_user(local_iov_kern, local_iov, liovcnt * sizeof(struct iovec));
   retval = copy_from_user(remote_iov_kern, remote_iov, riovcnt * sizeof(struct iovec));
   
   remote_task = pid_task(find_vpid(pid), PIDTYPE_PID);
@@ -199,7 +222,7 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
     if(retval) ;//TODO: error out in some not braindead way
     printk(KERN_INFO "LINDLKM: something happened??\n");
     copied_count += local_iov_kern[i].iov_len;
-    printk(KERN_INFO "looped right?\n");
+    printk(KERN_INFO "LINDLKM: looped right?\n");
   }
   kfree(local_iov_kern);
   kfree(remote_iov_kern);
@@ -267,8 +290,9 @@ static int __init cowcall_init(void) {
   ivs = (int(*)(void*, void*)) kln("insert_vm_struct");
   cvma = (void* (*)(void*, unsigned long, unsigned long, pgoff_t, void*)) kln("copy_vma");
   vitia = (void (*)(void*, void*, void*))kln("vma_interval_tree_insert_after");
-  cp4dr = (int (*)(void*, void*, void*, void*, unsigned long, unsigned long)) kln("copy_p4d_range");
   ftmr = (void (*)(void*, unsigned long, unsigned long, int, bool)) kln("flush_tlb_mm_range");
+  p4da = (p4d_t *(*)(void*, void*, unsigned long)) kln("__p4d_alloc");
+  puda = (pud_t *(*)(void*, void*, unsigned long)) kln("__pud_alloc");
   return 0;
 }
 
