@@ -12,6 +12,7 @@
 #include <linux/mm.h>
 #include <linux/kprobes.h>
 #include <linux/mmu_notifier.h>
+#include <linux/swap.h>
 #include <asm/tlbflush.h>
 #include <asm/uaccess.h>
 
@@ -22,6 +23,9 @@ MODULE_VERSION("0.1");
 
 #define p4dalloc(a, b, c) (unlikely(pgd_none(*(b)) && p4da((a), (b), (c))) ? NULL : p4d_offset((b), (c)))
 #define pudalloc(a, b, c) (unlikely(p4d_none(*(b)) && puda((a), (b), (c))) ? NULL : pud_offset((b), (c)))
+#define pmdalloc(a, b, c) (unlikely(pud_none(*(b)) && pmda((a), (b), (c))) ? NULL : pmd_offset((b), (c)))
+#undef pte_alloc
+#define pte_alloc(mm, pmd) (unlikely(pmd_none(*(pmd))) && ptea(mm, pmd))
 
 void* klnaddr;
 unsigned long (*kln)(const char* name);
@@ -35,90 +39,189 @@ void (*vitia)(void*, void*, void*);
 void (*ftmr)(void*, unsigned long, unsigned long, int, bool);
 p4d_t *(*p4da)(void*, void*, unsigned long);
 pud_t *(*puda)(void*, void*, unsigned long);
+pmd_t *(*pmda)(void*, void*, unsigned long);
+pte_t *(*ptea)(void*, void*);
+void (*smmrss)(void*);
+void (*mtrs)(void*, int, long);
 
 //Get address of kallsyms_lookup_name, from https://github.com/zizzu0/LinuxKernelModules
 static int __kprobes pre0(struct kprobe *p, struct pt_regs *regs) {
-  klnaddr = (void*) --regs->ip;
-  return 0;
+	klnaddr = (void*) --regs->ip;
+	return 0;
 }
 static int __kprobes pre1(struct kprobe *p, struct pt_regs *regs) {
-  return 0;
+	return 0;
 }
 static void do_register_kprobe(struct kprobe *kp, char *symbol_name, void* handler) {
-  kp->symbol_name = symbol_name;
-  kp->pre_handler = handler;
-  register_kprobe(kp);
+	kp->symbol_name = symbol_name;
+	kp->pre_handler = handler;
+	register_kprobe(kp);
 }
 void lookup_lookup_name(void) {
-  struct kprobe kp0, kp1;
-  do_register_kprobe(&kp0, "kallsyms_lookup_name", pre0);
-  do_register_kprobe(&kp1, "kallsyms_lookup_name", pre1);
-  unregister_kprobe(&kp0);
-  unregister_kprobe(&kp1);
-  kln = (unsigned long(*)(const char*))klnaddr;
+	struct kprobe kp0, kp1;
+	do_register_kprobe(&kp0, "kallsyms_lookup_name", pre0);
+	do_register_kprobe(&kp1, "kallsyms_lookup_name", pre1);
+	unregister_kprobe(&kp0);
+	unregister_kprobe(&kp1);
+	kln = (unsigned long(*)(const char*))klnaddr;
 }
 
 int custom_copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma) {
-  pgd_t *src_pgd, *dst_pgd;
-  unsigned long srcnext;
-  unsigned long dstnext;
-  unsigned long srcaddr = src_vma->vm_start;
-  unsigned long srcend = src_vma->vm_end;
-  unsigned long dstaddr = dst_vma->vm_start;
-  unsigned long dstend = dst_vma->vm_end;
-  struct mm_struct *dst_mm = dst_vma->vm_mm;
-  struct mm_struct *src_mm = src_vma->vm_mm;
-  bool is_cow;
-  int ret;
-  p4d_t *src_p4d, *dst_p4d;
-  pud_t *src_pud, *dst_pud;
-  unsigned long p4d_dst_next, p4d_src_next;
-  unsigned long pud_dst_next, pud_src_next;
-  if(!(src_vma->vm_flags & (VM_HUGETLB | VM_PFNMAP | VM_MIXEDMAP)) && !src_vma->anon_vma)
-    return 0;
-  if(is_vm_hugetlb_page(src_vma))
-    return 0; //we don't handle hugetlb pages yet
-  if(unlikely(src_vma->vm_flags & VM_PFNMAP))
-    return 0; //we don't handle pure page regions
+	pgd_t *src_pgd, *dst_pgd;
+	unsigned long srcnext;
+	unsigned long dstnext;
+	unsigned long srcaddr = src_vma->vm_start;
+	unsigned long srcend = src_vma->vm_end;
+	unsigned long dstaddr = dst_vma->vm_start;
+	unsigned long dstend = dst_vma->vm_end;
+	struct mm_struct *dst_mm = dst_vma->vm_mm;
+	struct mm_struct *src_mm = src_vma->vm_mm;
+	bool is_cow;
+	int ret;
+	p4d_t *src_p4d, *dst_p4d;
+	pud_t *src_pud, *dst_pud;
+	pmd_t *src_pmd, *dst_pmd;
+	unsigned long p4d_dst_next, p4d_src_next;
+	unsigned long pud_dst_next, pud_src_next;
+	unsigned long pmd_dst_next, pmd_src_next;
+	if(!(src_vma->vm_flags & (VM_HUGETLB | VM_PFNMAP | VM_MIXEDMAP)) && !src_vma->anon_vma)
+		return 0;
+	if(is_vm_hugetlb_page(src_vma))
+		return 0; //we don't handle hugetlb pages yet
+	if(unlikely(src_vma->vm_flags & VM_PFNMAP))
+		return 0; //we don't handle pure page regions
 
-  is_cow = (src_vma->vm_flags & (VM_SHARED | VM_MAYWRITE)) == VM_MAYWRITE;
-  if(is_cow) {
-    //I am currently unsure, but I believe this ought to be done to the destination locations?
-    mmap_write_lock(src_mm);
-    raw_write_seqcount_begin(&src_mm->write_protect_seq);
-    mmap_write_unlock(src_mm);
-  }
+	is_cow = (src_vma->vm_flags & (VM_SHARED | VM_MAYWRITE)) == VM_MAYWRITE;
+	if(is_cow) {
+		//I am currently unsure, but I believe this ought to be done to the destination locations?
+		mmap_write_lock(src_mm);
+		raw_write_seqcount_begin(&src_mm->write_protect_seq);
+		mmap_write_unlock(src_mm);
+	}
 
-  printk(KERN_INFO "LINDLKM: initial iscow garbage\n");
-  ret = 0;
-  dst_pgd = pgd_offset(dst_mm, dstaddr);
-  src_pgd = pgd_offset(src_mm, srcaddr);
-  printk(KERN_INFO "LINDLKM: offsets calculated\n");
+	printk(KERN_INFO "LINDLKM: initial iscow garbage\n");
+	ret = 0;
+	dst_pgd = pgd_offset(dst_mm, dstaddr);
+	src_pgd = pgd_offset(src_mm, srcaddr);
+	printk(KERN_INFO "LINDLKM: offsets calculated\n");
 
-  do {
-    srcnext = pgd_addr_end(srcaddr, srcend);
-    dstnext = pgd_addr_end(dstaddr, dstend);
-    if(pgd_none(*src_pgd) || pgd_bad(*src_pgd)) continue; //probably we should clear bad?
+	do {
+		srcnext = pgd_addr_end(srcaddr, srcend);
+		dstnext = pgd_addr_end(dstaddr, dstend);
+		if(pgd_none(*src_pgd) || pgd_bad(*src_pgd)) continue; //probably we should clear bad?
 
-    printk(KERN_INFO "LINDLKM: p4d details %p %p %lu\n", dst_mm, dst_pgd, dstaddr);
-    dst_p4d = p4dalloc(dst_mm, dst_pgd, dstaddr);
-    if(!dst_p4d) break; //error out better
-    src_p4d = p4d_offset(src_pgd, srcaddr);
-    do {
-      p4d_src_next = p4d_addr_end(srcaddr, srcnext);
-      p4d_dst_next = p4d_addr_end(dstaddr, dstnext);
-      if(p4d_none(*src_p4d) || p4d_bad(*src_p4d)) continue;
+		printk(KERN_INFO "LINDLKM: p4d details %p %p %lu\n", dst_mm, dst_pgd, dstaddr);
+		dst_p4d = p4dalloc(dst_mm, dst_pgd, dstaddr);
+		if(!dst_p4d) break; //error out better
+		src_p4d = p4d_offset(src_pgd, srcaddr);
+		do {
+			p4d_src_next = p4d_addr_end(srcaddr, srcnext);
+			p4d_dst_next = p4d_addr_end(dstaddr, dstnext);
+			if(p4d_none(*src_p4d) || p4d_bad(*src_p4d)) continue;
 
-      dst_pud = pudalloc(dst_mm, dst_p4d, dstaddr);
-      if(!dst_pud) break; //error out better
-      src_pud = pud_offset(src_p4d, srcaddr);
-      printk(KERN_INFO "LINDLKM: pud did it\n");
-      do {
-        pud_src_next = pud_addr_end(srcaddr, p4d_src_next);
-        pud_dst_next = pud_addr_end(dstaddr, p4d_dst_next);
-	if(pud_trans_huge(*src_pud) || pud_devmap(*src_pud)) break; //error out better, we don't support hugetlb pages
-	if(pud_none(*src_pud) || pud_bad(*src_pud)) continue;
-	//copy_pmd_range then long copy_pte_range and we're out of this hell
+			dst_pud = pudalloc(dst_mm, dst_p4d, dstaddr);
+			if(!dst_pud) break; //error out better
+			src_pud = pud_offset(src_p4d, srcaddr);
+			printk(KERN_INFO "LINDLKM: pud did it\n");
+			do {
+				pud_src_next = pud_addr_end(srcaddr, p4d_src_next);
+				pud_dst_next = pud_addr_end(dstaddr, p4d_dst_next);
+				if(pud_trans_huge(*src_pud) || pud_devmap(*src_pud)) break; //error out better, we don't support hugetlb pages
+				if(pud_none(*src_pud) || pud_bad(*src_pud)) continue;
+
+				dst_pmd = pmdalloc(dst_mm, dst_pud, srcaddr);
+				if(!dst_pmd) break; //error out better
+				src_pmd = pmd_offset(src_pud, dstaddr);
+			  printk(KERN_INFO "LINDLKM: pmd did it\n");
+				do {
+					pmd_src_next = pmd_addr_end(srcaddr, pud_src_next);
+					pmd_dst_next = pmd_addr_end(dstaddr, pud_dst_next);
+					if(pmd_trans_huge(*src_pmd) || pmd_devmap(*src_pmd)) break; //we don't care about hugepages
+          if(is_swap_pmd(*src_pmd)) 
+						; //not sure how to handle swapped out pages?
+			    printk(KERN_INFO "LINDLKM: pmd stats %d %d\n", pmd_none(*src_pmd), pmd_bad(*src_pmd));
+				  if(pmd_none(*src_pmd) || pmd_bad(*src_pmd)) continue;
+			    printk(KERN_INFO "LINDLKM: pmd not none or bad\n");
+
+					{
+            pte_t *orig_src_pte, *orig_dst_pte;
+            pte_t *src_pte, *dst_pte;
+						spinlock_t *src_ptl, *dst_ptl;
+						int progress, ret = 0;
+						int rss[NR_MM_COUNTERS];
+						swp_entry_t entry = (swp_entry_t){0};
+						struct page* prealloc = NULL;
+again:
+			      printk(KERN_INFO "LINDLKM: pte did it\n");
+						progress = 0;
+						memset(rss, 0, sizeof(int) * NR_MM_COUNTERS);
+						dst_pte = pte_alloc_map_lock(dst_mm, dst_pmd, dstaddr, &dst_ptl);
+						if(!dst_pte) break; //error out better
+						src_pte = pte_offset_map(src_pmd, srcaddr);
+						src_ptl = pte_lockptr(src_mm, src_pmd);
+						spin_lock_nested(src_ptl, SINGLE_DEPTH_NESTING);
+						orig_src_pte = src_pte;
+						orig_dst_pte = dst_pte;
+						arch_enter_lazy_mmu_mode();
+						do {
+							if(progress >= 32) {
+								progress = 0;
+								if(need_resched() || spin_needbreak(src_ptl) || spin_needbreak(dst_ptl)) break;//source of error?
+							}
+							if(pte_none(*src_pte)) {
+								progress++;
+								continue;
+							}
+							if(unlikely(!pte_present(*src_pte))) {
+						    printk(KERN_INFO "LINDLKM: copying nonpresent pte\n");
+								break; //we'll need to do copy_nonpresent_pte
+								//entry.val = copy_nonpresent_pte(dst_mm, src_mm, dst_pte, src_pte, src_vma, dstaddr, rss);
+								if(entry.val) break;
+								progress += 8;
+								continue;
+							}
+						  printk(KERN_INFO "LINDLKM: copying present pte\n");
+							//ret = copy_present_pte(dst_vma, src_vma, dst_pte, src_pte, addr, rss, &prealloc);
+							//if(unlikely(ret == -EAGAIN)) break;
+							//if(unlikely(prealloc)) {
+							//	put_page(prealloc);
+							//	prealloc = NULL;
+							//}
+							progress += 8;
+						} while(dst_pte++, src_pte++, srcaddr += PAGE_SIZE, dstaddr += PAGE_SIZE, srcaddr != pmd_src_next);
+						arch_leave_lazy_mmu_mode();
+						spin_unlock(src_ptl);
+						pte_unmap(orig_src_pte); //??
+						{
+							int i;
+							if(current->mm == dst_mm) smmrss(dst_mm);
+							for(i = 0; i < NR_MM_COUNTERS; i++) if(rss[i]) {
+								long count = atomic_long_add_return(rss[i], &dst_mm->rss_stat.count[i]);
+								mtrs(dst_mm, i, count);
+							}
+						} //add_mm_rss_vec(dst_mm, rss);
+						pte_unmap_unlock(orig_dst_pte, dst_ptl);
+						cond_resched();
+
+						if(entry.val) {
+							if(add_swap_count_continuation(entry, GFP_KERNEL) < 0) {
+								ret = -ENOMEM;
+								goto out;
+							}
+							entry.val = 0;
+						} else if(ret) {
+							WARN_ON_ONCE(ret != -EAGAIN);
+							//prealloc = page_copy_prealloc(src_mm, src_vma, srcaddr);
+							//handle page_copy_prealloc
+							if(!prealloc) break; //error out better
+							ret = 0;
+						}
+						if(srcaddr != pmd_src_next) goto again;
+out:
+						if(unlikely(prealloc)) put_page(prealloc);
+					} //copy_pte_range
+
+				} while(dst_pmd++, src_pmd++, srcaddr = pmd_src_next, dstaddr = pmd_dst_next, srcaddr != pud_src_next);
       } while(dst_pud++, src_pud++, srcaddr = pud_src_next, dstaddr = pud_dst_next, srcaddr != p4d_src_next);
     } while(dst_p4d++, src_p4d++, srcaddr = p4d_src_next, dstaddr = p4d_dst_next, srcaddr != srcnext);
     printk(KERN_INFO "LINDLKM: did stupid copy?\n");
@@ -293,6 +396,10 @@ static int __init cowcall_init(void) {
   ftmr = (void (*)(void*, unsigned long, unsigned long, int, bool)) kln("flush_tlb_mm_range");
   p4da = (p4d_t *(*)(void*, void*, unsigned long)) kln("__p4d_alloc");
   puda = (pud_t *(*)(void*, void*, unsigned long)) kln("__pud_alloc");
+  pmda = (pmd_t *(*)(void*, void*, unsigned long)) kln("__pmd_alloc");
+  ptea = (pte_t *(*)(void*, void*)) kln("__pte_alloc");
+  smmrss = (void (*)(void*)) kln("sync_mm_rss");
+	mtrs = (void (*)(void*, int, long)) kln("mm_trace_rss_stat");
   return 0;
 }
 
