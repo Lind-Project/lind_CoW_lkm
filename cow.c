@@ -238,7 +238,7 @@ int custom_copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct
         if(pud_trans_huge(*src_pud) || pud_devmap(*src_pud)) break; //error out better, we don't support hugetlb pages
         if(pud_none(*src_pud) || pud_bad(*src_pud)) continue;
 
-        dst_pmd = pmdalloc(dst_mm, dst_pud, srcaddr);
+        dst_pmd = pmdalloc(dst_mm, dst_pud, dstaddr);
         if(!dst_pmd) break; //error out better
         src_pmd = pmd_offset(src_pud, srcaddr);
         do {
