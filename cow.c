@@ -56,6 +56,8 @@ typeof(&security_vm_enough_memory_mm) svmemm;
 typeof(&vm_stat_account) vmstata;
 typeof(&__vma_link_rb) vmalrb;
 typeof(&lru_cache_add_inactive_or_unevictable) lcaiou;
+typeof(&__mmu_notifier_invalidate_range_start) mnirs;
+typeof(&__mmu_notifier_invalidate_range_end) mnire;
 
 //Get address of kallsyms_lookup_name, from https://github.com/zizzu0/LinuxKernelModules
 static int __kprobes pre0(struct kprobe *p, struct pt_regs *regs) {
@@ -70,7 +72,23 @@ static void do_register_kprobe(struct kprobe *kp, char *symbol_name, void* handl
   kp->pre_handler = handler;
   register_kprobe(kp);
 }
-void lookup_lookup_name(void) {
+
+static inline void custom_mmu_notifier_invalidate_range_start(struct mmu_notifier_range* range) {
+  might_sleep();
+  lock_map_acquire(&__mmu_notifier_invalidate_range_start_map);
+  if(mm_has_notifiers(range->mm)) {
+    range->flags |= MMU_NOTIFIER_RANGE_BLOCKABLE;
+    mnirs(range);
+  }
+  lock_map_release(&__mmu_notifier_invalidate_range_start_map);
+}
+static inline void custom_mmu_notifier_invalidate_range_end(struct mmu_notifier_range* range) {
+  if(mmu_notifier_range_blockable(range)) might_sleep();
+  if(mm_has_notifiers(range->mm)) mnire(range, false);
+}
+
+
+static void lookup_lookup_name(void) {
   struct kprobe kp0, kp1;
   do_register_kprobe(&kp0, "kallsyms_lookup_name", pre0);
   do_register_kprobe(&kp1, "kallsyms_lookup_name", pre1);
@@ -79,7 +97,7 @@ void lookup_lookup_name(void) {
   kln = (unsigned long(*)(const char*))klnaddr;
 }
 
-int custom_find_vma_links(struct mm_struct *mm, unsigned long addr, unsigned long end, struct vm_area_struct **pprev, struct rb_node ***rb_link, struct rb_node **rb_parent) {
+static int custom_find_vma_links(struct mm_struct *mm, unsigned long addr, unsigned long end, struct vm_area_struct **pprev, struct rb_node ***rb_link, struct rb_node **rb_parent) {
     struct rb_node **__rb_link, *__rb_parent, *rb_prev;
     __rb_link = &mm->mm_rb.rb_node;
     rb_prev = __rb_parent = NULL;
@@ -105,7 +123,7 @@ int custom_find_vma_links(struct mm_struct *mm, unsigned long addr, unsigned lon
     return 0;
 }
 
-int custom_copy_present_pte(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma, pte_t *dst_pte, pte_t *src_pte, unsigned long addr, unsigned long srcaddr, int *rss, struct page **prealloc) {
+static int custom_copy_present_pte(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma, pte_t *dst_pte, pte_t *src_pte, unsigned long dstaddr, unsigned long srcaddr, int *rss, struct page **prealloc) {
   struct mm_struct *src_mm = src_vma->vm_mm;
   unsigned long vm_flags = src_vma->vm_flags;
   pte_t pte = *src_pte;
@@ -122,15 +140,15 @@ int custom_copy_present_pte(struct vm_area_struct *dst_vma, struct vm_area_struc
     new_page = *prealloc;
     if(!new_page) {retval = -EAGAIN; goto page_copied;}
     *prealloc = NULL;
-    copy_user_highpage(new_page, page, addr, src_vma);
+    copy_user_highpage(new_page, page, dstaddr, src_vma);
     __SetPageUptodate(new_page);
-    panar(new_page, dst_vma, addr, false);
+    panar(new_page, dst_vma, dstaddr, false);
     lcaiou(new_page, dst_vma);
     rss[mm_counter(new_page)]++;
 
     pte = mk_pte(new_page, dst_vma->vm_page_prot);
     pte = maybe_mkwrite(pte_mkdirty(pte), dst_vma);
-    set_pte_at(dst_vma->vm_mm, addr, dst_pte, pte);
+    set_pte_at(dst_vma->vm_mm, dstaddr, dst_pte, pte);
     return 0;
 page_copied:
 
@@ -150,8 +168,7 @@ page_copied:
   pte = pte_mkold(pte);
 
   if(!(vm_flags = VM_UFFD_WP)) pte = pte_clear_uffd_wp(pte);
-  set_pte_at(dst_vma->vm_mm, addr, dst_pte, pte);
-  printk(KERN_INFO "LINDLKM: src and dst ptes address page %p %p\n", pte_page(pte), pte_page(*dst_pte));
+  set_pte_at(dst_vma->vm_mm, dstaddr, dst_pte, pte);
   return 0;
 }
 
@@ -165,6 +182,7 @@ int custom_copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct
   unsigned long dstend = dst_vma->vm_end;
   struct mm_struct *dst_mm = dst_vma->vm_mm;
   struct mm_struct *src_mm = src_vma->vm_mm;
+  struct mmu_notifier_range range;
   bool is_cow;
   int ret;
   p4d_t *src_p4d, *dst_p4d;
@@ -186,7 +204,9 @@ int custom_copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct
   mmap_write_lock(dst_mm);
   is_cow = (src_vma->vm_flags & (VM_SHARED | VM_MAYWRITE)) == VM_MAYWRITE;
   if(is_cow) {
-    //can we do mmu_notifier stuff here?
+    mmu_notifier_range_init(&range, MMU_NOTIFY_PROTECTION_PAGE, 0, src_vma, src_mm, srcaddr, srcend);
+    custom_mmu_notifier_invalidate_range_start(&range);
+    //mmap_assert_write_locked(src_mm);
     raw_write_seqcount_begin(&src_mm->write_protect_seq);
   }
 
@@ -240,6 +260,7 @@ int custom_copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct
 again:
             progress = 0;
 	    memset(rss, 0, sizeof(int) * NR_MM_COUNTERS);
+
             dst_pte = pte_alloc_map_lock(dst_mm, dst_pmd, dstaddr, &dst_ptl);
             if(!dst_pte) break; //error out better
             src_pte = pte_offset_map(src_pmd, srcaddr);
@@ -273,10 +294,10 @@ again:
                 prealloc = NULL;
               }
               progress += 8;
-            } while(dst_pte++, src_pte++, srcaddr += PAGE_SIZE, dstaddr += PAGE_SIZE, srcaddr != pmd_src_next);
+            } while(dst_pte++, src_pte++, srcaddr += PAGE_SIZE, dstaddr += PAGE_SIZE, srcaddr != pmd_src_next && dstaddr != pmd_dst_next);
             arch_leave_lazy_mmu_mode();
             spin_unlock(src_ptl);
-            pte_unmap(orig_src_pte); //??
+            pte_unmap(orig_src_pte);
 	    {
               int i;
 	      if(current->mm == dst_mm) {
@@ -316,13 +337,13 @@ out:
             if(unlikely(prealloc)) put_page(prealloc);
           } //copy_pte_range
 
-        } while(dst_pmd++, src_pmd++, srcaddr = pmd_src_next, dstaddr = pmd_dst_next, srcaddr != pud_src_next);
-      } while(dst_pud++, src_pud++, srcaddr = pud_src_next, dstaddr = pud_dst_next, srcaddr != p4d_src_next);
-    } while(dst_p4d++, src_p4d++, srcaddr = p4d_src_next, dstaddr = p4d_dst_next, srcaddr != srcnext);
-  } while (dst_pgd++, src_pgd++, srcaddr = srcnext, dstaddr = dstnext, srcaddr != srcend);
+        } while(dst_pmd++, src_pmd++, srcaddr = pmd_src_next, dstaddr = pmd_dst_next, srcaddr != pud_src_next && dstaddr != pud_dst_next);
+      } while(dst_pud++, src_pud++, srcaddr = pud_src_next, dstaddr = pud_dst_next, srcaddr != p4d_src_next && dstaddr != p4d_dst_next);
+    } while(dst_p4d++, src_p4d++, srcaddr = p4d_src_next, dstaddr = p4d_dst_next, srcaddr != srcnext && dstaddr != dstnext);
+  } while (dst_pgd++, src_pgd++, srcaddr = srcnext, dstaddr = dstnext, srcaddr != srcend && dstaddr != dstend);
   if(is_cow) {
     raw_write_seqcount_end(&src_mm->write_protect_seq);
-    //flushing cache range would be a no-op on x86
+    custom_mmu_notifier_invalidate_range_end(&range);
   }
   mmap_write_unlock(dst_mm);
   return ret;
@@ -587,6 +608,8 @@ static int __init cowcall_init(void) {
   vmstata = (typeof(&vm_stat_account)) kln("vm_stat_account");
   vmalrb = (typeof(&__vma_link_rb)) kln("__vma_link_rb");
   lcaiou = (typeof(&lru_cache_add_inactive_or_unevictable)) kln("lru_cache_add_inactive_or_unevictable");
+  mnirs = (typeof(&__mmu_notifier_invalidate_range_start)) kln("__mmu_notifier_invalidate_range_start");
+  mnire = (typeof(&__mmu_notifier_invalidate_range_end)) kln("__mmu_notifier_invalidate_range_end");
   return 0;
 }
 
