@@ -172,10 +172,183 @@ page_copied:
   return 0;
 }
 
+static int general_copy_pte_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
+		                  pmd_t *dst_pmd, pmd_t *src_pmd,
+		                  unsigned long dstaddr, unsigned long srcaddr,
+		                  unsigned long dstend, unsigned long srcend) {
+  pte_t *orig_src_pte, *orig_dst_pte;
+  pte_t *src_pte, *dst_pte;
+  spinlock_t *src_ptl, *dst_ptl;
+  int progress, ret = 0;
+  int rss[NR_MM_COUNTERS];
+  swp_entry_t entry = (swp_entry_t){0};
+  struct page* prealloc = NULL;
+  struct mm_struct *dst_mm = dst_vma->vm_mm;
+  struct mm_struct *src_mm = src_vma->vm_mm;
+again:
+  progress = 0;
+  memset(rss, 0, sizeof(int) * NR_MM_COUNTERS);
+
+  dst_pte = pte_alloc_map_lock(dst_mm, dst_pmd, dstaddr, &dst_ptl);
+  if(!dst_pte) {
+    ret = -ENOMEM;
+    goto out;
+  }
+  src_pte = pte_offset_map(src_pmd, srcaddr);
+  src_ptl = pte_lockptr(src_mm, src_pmd);
+  spin_lock_nested(src_ptl, SINGLE_DEPTH_NESTING);
+  orig_src_pte = src_pte;
+  orig_dst_pte = dst_pte;
+  arch_enter_lazy_mmu_mode();
+  do {
+    printk(KERN_INFO "LINDLKM: %lx %lx\n", srcaddr, dstaddr);
+    if(progress >= 32) {
+      progress = 0;
+      if(need_resched() || spin_needbreak(src_ptl) || spin_needbreak(dst_ptl)) break;//source of error?
+    }
+    if(pte_none(*src_pte)) {
+      progress++;
+      continue;
+    }
+    if(unlikely(!pte_present(*src_pte))) {
+      printk(KERN_INFO "LINDLKM: copying nonpresent pte\n");
+      break; //we'll need to do copy_nonpresent_pte
+      //entry.val = copy_nonpresent_pte(dst_mm, src_mm, dst_pte, src_pte, src_vma, dstaddr, rss);
+      if(entry.val) break;
+      progress += 8;
+      continue;
+    }
+    printk(KERN_INFO "LINDLKM: copying present pte\n");
+    ret = custom_copy_present_pte(dst_vma, src_vma, dst_pte, src_pte, dstaddr, srcaddr, rss, &prealloc);
+    if(unlikely(ret == -EAGAIN)) break;
+    if(unlikely(prealloc)) {
+      put_page(prealloc);
+      prealloc = NULL;
+    }
+    progress += 8;
+  } while(dst_pte++, src_pte++, srcaddr += PAGE_SIZE, dstaddr += PAGE_SIZE, srcaddr != srcend && dstaddr != dstend);
+  printk(KERN_INFO "LINDLKM: %lx %lx\n", srcaddr, dstaddr);
+  arch_leave_lazy_mmu_mode();
+  spin_unlock(src_ptl);
+  pte_unmap(orig_src_pte);
+  {
+    int i;
+    if(current->mm == dst_mm) {
+      for(i = 0; i < NR_MM_COUNTERS; i++) {
+        if(current->rss_stat.count[i]) {
+          long count = atomic_long_add_return(rss[i], &dst_mm->rss_stat.count[i]);
+          mtrs(dst_mm, i, count);
+          current->rss_stat.count[i] = 0;
+        }
+      }
+    }
+    for(i = 0; i < NR_MM_COUNTERS; i++) {
+      if(rss[i]) {
+        long count = atomic_long_add_return(rss[i], &dst_mm->rss_stat.count[i]);
+        mtrs(dst_mm, i, count);
+      }
+    }
+  } //add_mm_rss_vec
+  pte_unmap_unlock(orig_dst_pte, dst_ptl);
+  cond_resched();
+
+  if(entry.val) {
+    if(add_swap_count_continuation(entry, GFP_KERNEL) < 0) {
+      ret = -ENOMEM;
+      goto out;
+    }
+    entry.val = 0;
+  } else if(ret) {
+    WARN_ON_ONCE(ret != -EAGAIN);
+    //prealloc = page_copy_prealloc(src_mm, src_vma, srcaddr);
+    //handle page_copy_prealloc
+    if(!prealloc) return -ENOMEM; //error out better
+    ret = 0;
+  }
+  if(srcaddr != srcend) goto again;
+out:
+  if(unlikely(prealloc)) put_page(prealloc);
+  return ret;
+}
+
+static int general_copy_pmd_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
+		                  pud_t *dst_pud, pud_t *src_pud,
+		                  unsigned long dstaddr, unsigned long srcaddr,
+		                  unsigned long dstend, unsigned long srcend) {
+  struct mm_struct *dst_mm = dst_vma->vm_mm;
+  struct mm_struct *src_mm = src_vma->vm_mm;
+  pmd_t *src_pmd, *dst_pmd;
+  unsigned long pmd_src_next, pmd_dst_next;
+  (void)src_mm;
+  dst_pmd = pmdalloc(dst_mm, dst_pud, dstaddr);
+  if(!dst_pmd) return -ENOMEM;
+  src_pmd = pmd_offset(src_pud, srcaddr);
+  do {
+    pmd_src_next = pmd_addr_end(srcaddr, srcend);
+    pmd_dst_next = pmd_addr_end(dstaddr, dstend);
+    if(pmd_trans_huge(*src_pmd) || pmd_devmap(*src_pmd)) break; //we don't deal with hugepages
+    if(is_swap_pmd(*src_pmd)) 
+      ; //not sure how to handle swapped out pages?
+    if(pmd_none(*src_pmd) || pmd_bad(*src_pmd)) continue;
+
+    if(general_copy_pte_range(dst_vma, src_vma, dst_pmd, src_pmd, dstaddr, srcaddr, pmd_dst_next, pmd_src_next))
+      return -ENOMEM;
+  } while(dst_pmd++, src_pmd++, srcaddr = pmd_src_next, dstaddr = pmd_dst_next, srcaddr != srcend && dstaddr != dstend);
+  return 0;
+}
+
+static int general_copy_pud_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
+		                  p4d_t *dst_p4d, p4d_t *src_p4d,
+		                  unsigned long dstaddr, unsigned long srcaddr,
+		                  unsigned long dstend, unsigned long srcend) {
+  struct mm_struct *dst_mm = dst_vma->vm_mm;
+  struct mm_struct *src_mm = src_vma->vm_mm;
+  pud_t *src_pud, *dst_pud;
+  unsigned long pud_src_next, pud_dst_next;
+  (void) src_mm;
+  dst_pud = pudalloc(dst_mm, dst_p4d, dstaddr);
+  if(!dst_pud) return -ENOMEM;
+  src_pud = pud_offset(src_p4d, srcaddr);
+  printk(KERN_INFO "LINDLKM: copying pud range %lx %lx %lx %lx %p %p\n", srcaddr, dstaddr, srcend, dstend, src_pud, dst_pud);
+  do {
+    pud_src_next = pud_addr_end(srcaddr, srcend);
+    pud_dst_next = pud_addr_end(dstaddr, dstend);
+    if(pud_trans_huge(*src_pud) || pud_devmap(*src_pud)) break; //error out better, we don't support hugetlb pages
+    if(pud_none(*src_pud) || pud_bad(*src_pud)) continue;
+
+    if(general_copy_pmd_range(dst_vma, src_vma, dst_pud, src_pud, dstaddr, srcaddr, pud_dst_next, pud_src_next))
+      return -ENOMEM;
+  } while(dst_pud++, src_pud++, srcaddr = pud_src_next, dstaddr = pud_dst_next, srcaddr != srcend && dstaddr != dstend);
+  return 0;
+}
+
+static int general_copy_p4d_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
+		                  pgd_t *dst_pgd, pgd_t *src_pgd,
+		                  unsigned long dstaddr, unsigned long srcaddr,
+		                  unsigned long dstend, unsigned long srcend) {
+  struct mm_struct *dst_mm = dst_vma->vm_mm;
+  struct mm_struct *src_mm = src_vma->vm_mm;
+  p4d_t *src_p4d, *dst_p4d;
+  unsigned long p4d_src_next, p4d_dst_next;
+  (void) src_mm;
+  dst_p4d = p4dalloc(dst_mm, dst_pgd, dstaddr);
+  if(!dst_p4d) return -ENOMEM;
+  src_p4d = p4d_offset(src_pgd, srcaddr);
+  do {
+    p4d_src_next = p4d_addr_end(srcaddr, srcend);
+    p4d_dst_next = p4d_addr_end(dstaddr, dstend);
+    printk(KERN_INFO "LINDLKM: copying p4d range %lx %lx %lx %lx %p %p\n", srcaddr, dstaddr, srcend, dstend, src_p4d, dst_p4d);
+    if(p4d_none(*src_p4d) || p4d_bad(*src_p4d)) continue;
+
+    if(general_copy_pud_range(dst_vma, src_vma, dst_p4d, src_p4d, dstaddr, srcaddr, p4d_dst_next, p4d_src_next))
+      return -ENOMEM;
+  } while(dst_p4d++, src_p4d++, srcaddr = p4d_src_next, dstaddr = p4d_dst_next, srcaddr != srcend && dstaddr != dstend);
+  return 0;
+}
+
 int custom_copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma) {
   pgd_t *src_pgd, *dst_pgd;
-  unsigned long srcnext;
-  unsigned long dstnext;
+  unsigned long srcnext, dstnext;
   unsigned long srcaddr = src_vma->vm_start;
   unsigned long srcend = src_vma->vm_end;
   unsigned long dstaddr = dst_vma->vm_start;
@@ -185,12 +358,7 @@ int custom_copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct
   struct mmu_notifier_range range;
   bool is_cow;
   int ret;
-  p4d_t *src_p4d, *dst_p4d;
-  pud_t *src_pud, *dst_pud;
-  pmd_t *src_pmd, *dst_pmd;
-  unsigned long p4d_dst_next, p4d_src_next;
-  unsigned long pud_dst_next, pud_src_next;
-  unsigned long pmd_dst_next, pmd_src_next;
+  printk(KERN_INFO "LINDLKM: page range entered\n");
   if(src_mm != dst_mm) return -ENOTSUPP;
   if(!(src_vma->vm_flags & (VM_HUGETLB | VM_PFNMAP | VM_MIXEDMAP)) && !src_vma->anon_vma)
     return 0;
@@ -212,6 +380,7 @@ int custom_copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct
 
   printk(KERN_INFO "LINDLKM: initial iscow garbage\n");
   ret = 0;
+
   dst_pgd = pgd_offset(dst_mm, dstaddr);
   src_pgd = pgd_offset(src_mm, srcaddr);
   printk(KERN_INFO "LINDLKM: offsets calculated\n");
@@ -221,126 +390,12 @@ int custom_copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct
     dstnext = pgd_addr_end(dstaddr, dstend);
     if(pgd_none(*src_pgd) || pgd_bad(*src_pgd)) continue; //probably we should clear bad?
 
-    dst_p4d = p4dalloc(dst_mm, dst_pgd, dstaddr);
-    if(!dst_p4d) break; //error out better
-    src_p4d = p4d_offset(src_pgd, srcaddr);
-    do {
-      p4d_src_next = p4d_addr_end(srcaddr, srcnext);
-      p4d_dst_next = p4d_addr_end(dstaddr, dstnext);
-      if(p4d_none(*src_p4d) || p4d_bad(*src_p4d)) continue;
-
-      dst_pud = pudalloc(dst_mm, dst_p4d, dstaddr);
-      if(!dst_pud) break; //error out better
-      src_pud = pud_offset(src_p4d, srcaddr);
-      do {
-        pud_src_next = pud_addr_end(srcaddr, p4d_src_next);
-        pud_dst_next = pud_addr_end(dstaddr, p4d_dst_next);
-        if(pud_trans_huge(*src_pud) || pud_devmap(*src_pud)) break; //error out better, we don't support hugetlb pages
-        if(pud_none(*src_pud) || pud_bad(*src_pud)) continue;
-
-        dst_pmd = pmdalloc(dst_mm, dst_pud, dstaddr);
-        if(!dst_pmd) break; //error out better
-        src_pmd = pmd_offset(src_pud, srcaddr);
-        do {
-          pmd_src_next = pmd_addr_end(srcaddr, pud_src_next);
-          pmd_dst_next = pmd_addr_end(dstaddr, pud_dst_next);
-          if(pmd_trans_huge(*src_pmd) || pmd_devmap(*src_pmd)) break; //we don't care about hugepages
-          if(is_swap_pmd(*src_pmd)) 
-            ; //not sure how to handle swapped out pages?
-          if(pmd_none(*src_pmd) || pmd_bad(*src_pmd)) continue;
-
-          {
-            pte_t *orig_src_pte, *orig_dst_pte;
-            pte_t *src_pte, *dst_pte;
-            spinlock_t *src_ptl, *dst_ptl;
-            int progress, ret = 0;
-            int rss[NR_MM_COUNTERS];
-            swp_entry_t entry = (swp_entry_t){0};
-            struct page* prealloc = NULL;
-again:
-            progress = 0;
-	    memset(rss, 0, sizeof(int) * NR_MM_COUNTERS);
-
-            dst_pte = pte_alloc_map_lock(dst_mm, dst_pmd, dstaddr, &dst_ptl);
-            if(!dst_pte) break; //error out better
-            src_pte = pte_offset_map(src_pmd, srcaddr);
-            src_ptl = pte_lockptr(src_mm, src_pmd);
-            spin_lock_nested(src_ptl, SINGLE_DEPTH_NESTING);
-            orig_src_pte = src_pte;
-            orig_dst_pte = dst_pte;
-            arch_enter_lazy_mmu_mode();
-            do {
-              if(progress >= 32) {
-                progress = 0;
-                if(need_resched() || spin_needbreak(src_ptl) || spin_needbreak(dst_ptl)) break;//source of error?
-              }
-              if(pte_none(*src_pte)) {
-                progress++;
-                continue;
-              }
-              if(unlikely(!pte_present(*src_pte))) {
-                printk(KERN_INFO "LINDLKM: copying nonpresent pte\n");
-                break; //we'll need to do copy_nonpresent_pte
-                //entry.val = copy_nonpresent_pte(dst_mm, src_mm, dst_pte, src_pte, src_vma, dstaddr, rss);
-                if(entry.val) break;
-                progress += 8;
-                continue;
-              }
-              printk(KERN_INFO "LINDLKM: copying present pte\n");
-              ret = custom_copy_present_pte(dst_vma, src_vma, dst_pte, src_pte, dstaddr, srcaddr, rss, &prealloc);
-              if(unlikely(ret == -EAGAIN)) break;
-              if(unlikely(prealloc)) {
-                put_page(prealloc);
-                prealloc = NULL;
-              }
-              progress += 8;
-            } while(dst_pte++, src_pte++, srcaddr += PAGE_SIZE, dstaddr += PAGE_SIZE, srcaddr != pmd_src_next && dstaddr != pmd_dst_next);
-            arch_leave_lazy_mmu_mode();
-            spin_unlock(src_ptl);
-            pte_unmap(orig_src_pte);
-	    {
-              int i;
-	      if(current->mm == dst_mm) {
-		for(i = 0; i < NR_MM_COUNTERS; i++) {
-	          if(current->rss_stat.count[i]) {
-                    long count = atomic_long_add_return(rss[i], &dst_mm->rss_stat.count[i]);
-		    mtrs(dst_mm, i, count);
-		    current->rss_stat.count[i] = 0;
-		  }
-		}
-	      }
-	      for(i = 0; i < NR_MM_COUNTERS; i++) {
-                if(rss[i]) {
-                  long count = atomic_long_add_return(rss[i], &dst_mm->rss_stat.count[i]);
-		  mtrs(dst_mm, i, count);
-		}
-	      }
-	    } //add_mm_rss_vec
-            pte_unmap_unlock(orig_dst_pte, dst_ptl);
-            cond_resched();
-
-            if(entry.val) {
-              if(add_swap_count_continuation(entry, GFP_KERNEL) < 0) {
-                ret = -ENOMEM;
-                goto out;
-              }
-              entry.val = 0;
-            } else if(ret) {
-              WARN_ON_ONCE(ret != -EAGAIN);
-              //prealloc = page_copy_prealloc(src_mm, src_vma, srcaddr);
-              //handle page_copy_prealloc
-              if(!prealloc) break; //error out better
-              ret = 0;
-            }
-            if(srcaddr != pmd_src_next) goto again;
-out:
-            if(unlikely(prealloc)) put_page(prealloc);
-          } //copy_pte_range
-
-        } while(dst_pmd++, src_pmd++, srcaddr = pmd_src_next, dstaddr = pmd_dst_next, srcaddr != pud_src_next && dstaddr != pud_dst_next);
-      } while(dst_pud++, src_pud++, srcaddr = pud_src_next, dstaddr = pud_dst_next, srcaddr != p4d_src_next && dstaddr != p4d_dst_next);
-    } while(dst_p4d++, src_p4d++, srcaddr = p4d_src_next, dstaddr = p4d_dst_next, srcaddr != srcnext && dstaddr != dstnext);
+    if(general_copy_p4d_range(dst_vma, src_vma, dst_pgd, src_pgd, dstaddr, srcaddr, dstnext, srcnext)) {
+      ret = -ENOMEM;
+      break;
+    }
   } while (dst_pgd++, src_pgd++, srcaddr = srcnext, dstaddr = dstnext, srcaddr != srcend && dstaddr != dstend);
+
   if(is_cow) {
     raw_write_seqcount_end(&src_mm->write_protect_seq);
     custom_mmu_notifier_invalidate_range_end(&range);
@@ -380,16 +435,19 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
   for(i = 0; i < liovcnt; i++) {
     if(local_iov_kern[i].iov_len != remote_iov_kern[i].iov_len) {
       retval = -EINVAL;
+      printk(KERN_INFO "LINDLKM: different lengths\n");
       goto out;
     }
     if(find_vma_intersection(remote_task->mm, (unsigned long) remote_iov_kern[i].iov_base, 
          (unsigned long) (remote_iov_kern[i].iov_base + remote_iov_kern[i].iov_len))) {
       retval = -EFAULT;
+      printk(KERN_INFO "LINDLKM: they intersect??\n");
       goto out;
     }
     if(!find_exact_vma(local_task->mm, (unsigned long) local_iov_kern[i].iov_base, 
             (unsigned long) (local_iov_kern[i].iov_base + local_iov_kern[i].iov_len))) {
       retval = -EFAULT;
+      printk(KERN_INFO "LINDLKM: there's no exact vma.\n");
       goto out;
     }
   }
