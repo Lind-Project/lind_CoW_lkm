@@ -201,7 +201,6 @@ again:
   orig_dst_pte = dst_pte;
   arch_enter_lazy_mmu_mode();
   do {
-    printk(KERN_INFO "LINDLKM: %lx %lx\n", srcaddr, dstaddr);
     if(progress >= 32) {
       progress = 0;
       if(need_resched() || spin_needbreak(src_ptl) || spin_needbreak(dst_ptl)) break;//source of error?
@@ -236,11 +235,12 @@ again:
     if(current->mm == dst_mm) {
       for(i = 0; i < NR_MM_COUNTERS; i++) {
         if(current->rss_stat.count[i]) {
-          long count = atomic_long_add_return(rss[i], &dst_mm->rss_stat.count[i]);
+          long count = atomic_long_add_return(current->rss_stat.count[i], &dst_mm->rss_stat.count[i]);
           mtrs(dst_mm, i, count);
           current->rss_stat.count[i] = 0;
         }
-      }
+      } //sync_mm_rss
+      current->rss_stat.events = 0;
     }
     for(i = 0; i < NR_MM_COUNTERS; i++) {
       if(rss[i]) {
@@ -272,9 +272,9 @@ out:
 }
 
 static int general_copy_pmd_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
-		                  pud_t *dst_pud, pud_t *src_pud,
-		                  unsigned long dstaddr, unsigned long srcaddr,
-		                  unsigned long dstend, unsigned long srcend) {
+                                  pud_t *dst_pud, pud_t *src_pud,
+                                  unsigned long dstaddr, unsigned long srcaddr,
+                                  unsigned long dstend, unsigned long srcend) {
   struct mm_struct *dst_mm = dst_vma->vm_mm;
   struct mm_struct *src_mm = src_vma->vm_mm;
   pmd_t *src_pmd, *dst_pmd;
@@ -298,9 +298,9 @@ static int general_copy_pmd_range(struct vm_area_struct *dst_vma, struct vm_area
 }
 
 static int general_copy_pud_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
-		                  p4d_t *dst_p4d, p4d_t *src_p4d,
-		                  unsigned long dstaddr, unsigned long srcaddr,
-		                  unsigned long dstend, unsigned long srcend) {
+                                  p4d_t *dst_p4d, p4d_t *src_p4d,
+                                  unsigned long dstaddr, unsigned long srcaddr,
+                                  unsigned long dstend, unsigned long srcend) {
   struct mm_struct *dst_mm = dst_vma->vm_mm;
   struct mm_struct *src_mm = src_vma->vm_mm;
   pud_t *src_pud, *dst_pud;
@@ -323,9 +323,9 @@ static int general_copy_pud_range(struct vm_area_struct *dst_vma, struct vm_area
 }
 
 static int general_copy_p4d_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
-		                  pgd_t *dst_pgd, pgd_t *src_pgd,
-		                  unsigned long dstaddr, unsigned long srcaddr,
-		                  unsigned long dstend, unsigned long srcend) {
+                                  pgd_t *dst_pgd, pgd_t *src_pgd,
+                                  unsigned long dstaddr, unsigned long srcaddr,
+                                  unsigned long dstend, unsigned long srcend) {
   struct mm_struct *dst_mm = dst_vma->vm_mm;
   struct mm_struct *src_mm = src_vma->vm_mm;
   p4d_t *src_p4d, *dst_p4d;
@@ -358,7 +358,6 @@ int custom_copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct
   struct mmu_notifier_range range;
   bool is_cow;
   int ret;
-  printk(KERN_INFO "LINDLKM: page range entered\n");
   if(src_mm != dst_mm) return -ENOTSUPP;
   if(!(src_vma->vm_flags & (VM_HUGETLB | VM_PFNMAP | VM_MIXEDMAP)) && !src_vma->anon_vma)
     return 0;
@@ -378,7 +377,6 @@ int custom_copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct
     raw_write_seqcount_begin(&src_mm->write_protect_seq);
   }
 
-  printk(KERN_INFO "LINDLKM: initial iscow garbage\n");
   ret = 0;
 
   dst_pgd = pgd_offset(dst_mm, dstaddr);
@@ -444,19 +442,24 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
       printk(KERN_INFO "LINDLKM: they intersect??\n");
       goto out;
     }
-    if(!find_exact_vma(local_task->mm, (unsigned long) local_iov_kern[i].iov_base, 
-            (unsigned long) (local_iov_kern[i].iov_base + local_iov_kern[i].iov_len))) {
-      retval = -EFAULT;
-      printk(KERN_INFO "LINDLKM: there's no exact vma.\n");
-      goto out;
-    }
+    //if(!find_exact_vma(local_task->mm, (unsigned long) local_iov_kern[i].iov_base, 
+    //        (unsigned long) (local_iov_kern[i].iov_base + local_iov_kern[i].iov_len))) {
+    //  retval = -EFAULT;
+    //  printk(KERN_INFO "LINDLKM: there's no exact vma.\n");
+    //  goto out;
+    //}
+    //find vmas in a different way
   }
   for(i = 0; i < liovcnt; i++) {
     unsigned int charge;
     struct file *file;
+    unsigned long localstart = (unsigned long)local_iov_kern[i].iov_base;
+    unsigned long localend = localstart + local_iov_kern[i].iov_len;
     rvma = NULL;
-    lvma = find_exact_vma(local_task->mm, (unsigned long) local_iov_kern[i].iov_base, 
-        (unsigned long) (local_iov_kern[i].iov_base + local_iov_kern[i].iov_len));
+anothervma:
+    lvma = find_vma_intersection(local_task->mm, localstart, localend);
+    localstart = lvma->vm_end;
+    printk(KERN_INFO "LINDLKM: vma found %p\n", lvma);
 
 
     if(lvma->vm_flags & VM_DONTCOPY) {
@@ -571,19 +574,16 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
     //should more be done? should some be done elsewhere?
 
     if(!(rvma->vm_flags & VM_WIPEONFORK)) {
-      printk(KERN_INFO "LINDLKM: %p %p \n", rvma, lvma);
       retval = custom_copy_page_range(rvma, lvma);
     }
     if(rvma->vm_ops && rvma->vm_ops->open)
       rvma->vm_ops->open(rvma);
     if(retval) ;//TODO: error out in some not braindead way
-    printk(KERN_INFO "LINDLKM: something I don't understand finished\n");
     retval = ivs(remote_task->mm, rvma);
     if(retval) ;//TODO: error out in some not braindead way
-    printk(KERN_INFO "LINDLKM: something happened??\n");
     copied_count += local_iov_kern[i].iov_len;
-    printk(KERN_INFO "LINDLKM: looped right?\n");
     ftmr(local_task->mm, lvma->vm_start, lvma->vm_end, PAGE_SHIFT, false);
+    if(localstart < localend) goto anothervma;
   }
   dufdc(&uf);
   kfree(local_iov_kern);
