@@ -153,7 +153,6 @@ static int custom_copy_present_pte(struct vm_area_struct *dst_vma, struct vm_are
 page_copied:
 
     if(retval <= 0) return retval;
-    printk(KERN_INFO "LINDLKM: nonzero retval\n");
     get_page(page);
     page_dup_rmap(page, false);
     rss[mm_counter(page)]++;
@@ -276,14 +275,12 @@ static int general_copy_pmd_range(struct vm_area_struct *dst_vma, struct vm_area
                                   unsigned long dstaddr, unsigned long srcaddr,
                                   unsigned long dstend, unsigned long srcend) {
   struct mm_struct *dst_mm = dst_vma->vm_mm;
-  struct mm_struct *src_mm = src_vma->vm_mm;
   pmd_t *src_pmd, *dst_pmd;
   unsigned long pmd_src_next, pmd_dst_next;
-  (void)src_mm;
   dst_pmd = pmdalloc(dst_mm, dst_pud, dstaddr);
   if(!dst_pmd) return -ENOMEM;
   src_pmd = pmd_offset(src_pud, srcaddr);
-  do {
+  while(srcaddr != srcend && dstaddr != dstend) {
     pmd_src_next = pmd_addr_end(srcaddr, srcend);
     pmd_dst_next = pmd_addr_end(dstaddr, dstend);
     if(pmd_trans_huge(*src_pmd) || pmd_devmap(*src_pmd)) break; //we don't deal with hugepages
@@ -293,7 +290,21 @@ static int general_copy_pmd_range(struct vm_area_struct *dst_vma, struct vm_area
 
     if(general_copy_pte_range(dst_vma, src_vma, dst_pmd, src_pmd, dstaddr, srcaddr, pmd_dst_next, pmd_src_next))
       return -ENOMEM;
-  } while(dst_pmd++, src_pmd++, srcaddr = pmd_src_next, dstaddr = pmd_dst_next, srcaddr != srcend && dstaddr != dstend);
+    if(pmd_src_next - srcaddr > pmd_dst_next - dstaddr && pmd_dst_next != dstaddr) {
+      dst_pmd++;
+      srcaddr += pmd_dst_next - dstaddr;
+      dstaddr = pmd_dst_next;
+      continue;
+    }
+    if(pmd_src_next - srcaddr < pmd_dst_next - dstaddr && pmd_src_next != srcaddr) {
+      src_pmd++;
+      dstaddr += pmd_src_next - srcaddr;
+      srcaddr = pmd_src_next;
+      continue;
+    }
+    dst_pmd++, src_pmd++, srcaddr = pmd_src_next, dstaddr = pmd_dst_next;
+  }
+
   return 0;
 }
 
@@ -310,7 +321,7 @@ static int general_copy_pud_range(struct vm_area_struct *dst_vma, struct vm_area
   if(!dst_pud) return -ENOMEM;
   src_pud = pud_offset(src_p4d, srcaddr);
   printk(KERN_INFO "LINDLKM: copying pud range %lx %lx %lx %lx %p %p\n", srcaddr, dstaddr, srcend, dstend, src_pud, dst_pud);
-  do {
+  while(srcaddr != srcend && dstaddr != dstend) {
     pud_src_next = pud_addr_end(srcaddr, srcend);
     pud_dst_next = pud_addr_end(dstaddr, dstend);
     if(pud_trans_huge(*src_pud) || pud_devmap(*src_pud)) break; //error out better, we don't support hugetlb pages
@@ -318,7 +329,20 @@ static int general_copy_pud_range(struct vm_area_struct *dst_vma, struct vm_area
 
     if(general_copy_pmd_range(dst_vma, src_vma, dst_pud, src_pud, dstaddr, srcaddr, pud_dst_next, pud_src_next))
       return -ENOMEM;
-  } while(dst_pud++, src_pud++, srcaddr = pud_src_next, dstaddr = pud_dst_next, srcaddr != srcend && dstaddr != dstend);
+    if(pud_src_next - srcaddr > pud_dst_next - dstaddr) {
+      dst_pud++;
+      srcaddr += pud_dst_next - dstaddr;
+      dstaddr = pud_dst_next;
+      continue;
+    }
+    if(pud_src_next - srcaddr < pud_dst_next - dstaddr) {
+      src_pud++;
+      dstaddr += pud_src_next - srcaddr;
+      srcaddr = pud_src_next;
+      continue;
+    }
+    dst_pud++, src_pud++, srcaddr = pud_src_next, dstaddr = pud_dst_next;
+  }
   return 0;
 }
 
@@ -334,7 +358,7 @@ static int general_copy_p4d_range(struct vm_area_struct *dst_vma, struct vm_area
   dst_p4d = p4dalloc(dst_mm, dst_pgd, dstaddr);
   if(!dst_p4d) return -ENOMEM;
   src_p4d = p4d_offset(src_pgd, srcaddr);
-  do {
+  while(srcaddr != srcend && dstaddr != dstend) {
     p4d_src_next = p4d_addr_end(srcaddr, srcend);
     p4d_dst_next = p4d_addr_end(dstaddr, dstend);
     printk(KERN_INFO "LINDLKM: copying p4d range %lx %lx %lx %lx %p %p\n", srcaddr, dstaddr, srcend, dstend, src_p4d, dst_p4d);
@@ -342,7 +366,20 @@ static int general_copy_p4d_range(struct vm_area_struct *dst_vma, struct vm_area
 
     if(general_copy_pud_range(dst_vma, src_vma, dst_p4d, src_p4d, dstaddr, srcaddr, p4d_dst_next, p4d_src_next))
       return -ENOMEM;
-  } while(dst_p4d++, src_p4d++, srcaddr = p4d_src_next, dstaddr = p4d_dst_next, srcaddr != srcend && dstaddr != dstend);
+    if(p4d_src_next - srcaddr > p4d_dst_next - dstaddr) {
+      dst_p4d++;
+      srcaddr += p4d_dst_next - dstaddr;
+      dstaddr = p4d_dst_next;
+      continue;
+    }
+    if(p4d_src_next - srcaddr < p4d_dst_next - dstaddr) {
+      src_p4d++;
+      dstaddr += p4d_src_next - srcaddr;
+      srcaddr = p4d_src_next;
+      continue;
+    }
+    dst_p4d++, src_p4d++, srcaddr = p4d_src_next, dstaddr = p4d_dst_next;
+  }
   return 0;
 }
 
@@ -383,7 +420,7 @@ int custom_copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct
   src_pgd = pgd_offset(src_mm, srcaddr);
   printk(KERN_INFO "LINDLKM: offsets calculated\n");
 
-  do {
+  while(srcaddr != srcend && dstaddr != dstend) {
     srcnext = pgd_addr_end(srcaddr, srcend);
     dstnext = pgd_addr_end(dstaddr, dstend);
     if(pgd_none(*src_pgd) || pgd_bad(*src_pgd)) continue; //probably we should clear bad?
@@ -392,7 +429,20 @@ int custom_copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct
       ret = -ENOMEM;
       break;
     }
-  } while (dst_pgd++, src_pgd++, srcaddr = srcnext, dstaddr = dstnext, srcaddr != srcend && dstaddr != dstend);
+    if(srcnext - srcaddr > dstnext - dstaddr) {
+      dst_pgd++;
+      srcaddr += dstnext - dstaddr;
+      dstaddr = dstnext;
+      continue;
+    }
+    if(srcnext - srcaddr < dstnext - dstaddr) {
+      src_pgd++;
+      dstaddr += srcnext - srcaddr;
+      srcaddr = srcnext;
+      continue;
+    }
+    dst_pgd++, src_pgd++, srcaddr = srcnext, dstaddr = dstnext;
+  }
 
   if(is_cow) {
     raw_write_seqcount_end(&src_mm->write_protect_seq);
