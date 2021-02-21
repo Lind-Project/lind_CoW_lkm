@@ -14,6 +14,7 @@
 #include <linux/mmu_notifier.h>
 #include <linux/swap.h>
 #include <linux/userfaultfd_k.h>
+#include <linux/pgtable.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Jonathan Singer");
@@ -132,7 +133,8 @@ static int custom_copy_present_pte(struct vm_area_struct *dst_vma, struct vm_are
   page = vnp(src_vma, srcaddr, pte);
   if(page) {
     int retval;
-    //copy_present_page here
+
+    //copy_present_page
     struct page *new_page;
     if(!((vm_flags & (VM_SHARED | VM_MAYWRITE)) == VM_MAYWRITE)) {retval = 1; goto page_copied;}
     if(likely(!atomic_read(&src_mm->has_pinned))) {retval = 1; goto page_copied;}
@@ -216,7 +218,7 @@ again:
       progress += 8;
       continue;
     }
-    printk(KERN_INFO "LINDLKM: copying present pte\n");
+    printk(KERN_INFO "LINDLKM: copying present pte %lx %lx\n", dstaddr, srcaddr);
     ret = custom_copy_present_pte(dst_vma, src_vma, dst_pte, src_pte, dstaddr, srcaddr, rss, &prealloc);
     if(unlikely(ret == -EAGAIN)) break;
     if(unlikely(prealloc)) {
@@ -225,7 +227,6 @@ again:
     }
     progress += 8;
   } while(dst_pte++, src_pte++, srcaddr += PAGE_SIZE, dstaddr += PAGE_SIZE, srcaddr != srcend && dstaddr != dstend);
-  printk(KERN_INFO "LINDLKM: %lx %lx\n", srcaddr, dstaddr);
   arch_leave_lazy_mmu_mode();
   spin_unlock(src_ptl);
   pte_unmap(orig_src_pte);
@@ -281,22 +282,21 @@ static int general_copy_pmd_range(struct vm_area_struct *dst_vma, struct vm_area
   if(!dst_pmd) return -ENOMEM;
   src_pmd = pmd_offset(src_pud, srcaddr);
   while(srcaddr != srcend && dstaddr != dstend) {
+    printk(KERN_INFO "LINDLKM: copying pmd range %lx %lx %p %p\n", srcaddr, dstaddr, src_pmd, dst_pmd);
     pmd_src_next = pmd_addr_end(srcaddr, srcend);
     pmd_dst_next = pmd_addr_end(dstaddr, dstend);
     if(pmd_trans_huge(*src_pmd) || pmd_devmap(*src_pmd)) break; //we don't deal with hugepages
-    if(is_swap_pmd(*src_pmd)) 
-      ; //not sure how to handle swapped out pages?
-    if(pmd_none(*src_pmd) || pmd_bad(*src_pmd)) continue;
-
-    if(general_copy_pte_range(dst_vma, src_vma, dst_pmd, src_pmd, dstaddr, srcaddr, pmd_dst_next, pmd_src_next))
-      return -ENOMEM;
-    if(pmd_src_next - srcaddr > pmd_dst_next - dstaddr && pmd_dst_next != dstaddr) {
+    if(is_swap_pmd(*src_pmd)) ; //not sure how to handle swapped out pages?
+    if(!(pmd_none(*src_pmd) || pmd_bad(*src_pmd)))
+      if(general_copy_pte_range(dst_vma, src_vma, dst_pmd, src_pmd, dstaddr, srcaddr, pmd_dst_next, pmd_src_next))
+        return -ENOMEM;
+    if(pmd_src_next - srcaddr > pmd_dst_next - dstaddr) {
       dst_pmd++;
       srcaddr += pmd_dst_next - dstaddr;
       dstaddr = pmd_dst_next;
       continue;
     }
-    if(pmd_src_next - srcaddr < pmd_dst_next - dstaddr && pmd_src_next != srcaddr) {
+    if(pmd_src_next - srcaddr < pmd_dst_next - dstaddr) {
       src_pmd++;
       dstaddr += pmd_src_next - srcaddr;
       srcaddr = pmd_src_next;
@@ -320,15 +320,14 @@ static int general_copy_pud_range(struct vm_area_struct *dst_vma, struct vm_area
   dst_pud = pudalloc(dst_mm, dst_p4d, dstaddr);
   if(!dst_pud) return -ENOMEM;
   src_pud = pud_offset(src_p4d, srcaddr);
-  printk(KERN_INFO "LINDLKM: copying pud range %lx %lx %lx %lx %p %p\n", srcaddr, dstaddr, srcend, dstend, src_pud, dst_pud);
+  printk(KERN_INFO "LINDLKM: copying pud range %lx %lx %p %p\n", srcaddr, dstaddr, src_pud, dst_pud);
   while(srcaddr != srcend && dstaddr != dstend) {
     pud_src_next = pud_addr_end(srcaddr, srcend);
     pud_dst_next = pud_addr_end(dstaddr, dstend);
     if(pud_trans_huge(*src_pud) || pud_devmap(*src_pud)) break; //error out better, we don't support hugetlb pages
-    if(pud_none(*src_pud) || pud_bad(*src_pud)) continue;
-
-    if(general_copy_pmd_range(dst_vma, src_vma, dst_pud, src_pud, dstaddr, srcaddr, pud_dst_next, pud_src_next))
-      return -ENOMEM;
+    if(!(pud_none(*src_pud) || pud_bad(*src_pud)))
+      if(general_copy_pmd_range(dst_vma, src_vma, dst_pud, src_pud, dstaddr, srcaddr, pud_dst_next, pud_src_next))
+        return -ENOMEM;
     if(pud_src_next - srcaddr > pud_dst_next - dstaddr) {
       dst_pud++;
       srcaddr += pud_dst_next - dstaddr;
@@ -361,11 +360,10 @@ static int general_copy_p4d_range(struct vm_area_struct *dst_vma, struct vm_area
   while(srcaddr != srcend && dstaddr != dstend) {
     p4d_src_next = p4d_addr_end(srcaddr, srcend);
     p4d_dst_next = p4d_addr_end(dstaddr, dstend);
-    printk(KERN_INFO "LINDLKM: copying p4d range %lx %lx %lx %lx %p %p\n", srcaddr, dstaddr, srcend, dstend, src_p4d, dst_p4d);
-    if(p4d_none(*src_p4d) || p4d_bad(*src_p4d)) continue;
-
-    if(general_copy_pud_range(dst_vma, src_vma, dst_p4d, src_p4d, dstaddr, srcaddr, p4d_dst_next, p4d_src_next))
-      return -ENOMEM;
+    printk(KERN_INFO "LINDLKM: copying p4d range %lx %lx %p %p\n", srcaddr, dstaddr, src_p4d, dst_p4d);
+    if(!(p4d_none(*src_p4d) || p4d_bad(*src_p4d)))
+      if(general_copy_pud_range(dst_vma, src_vma, dst_p4d, src_p4d, dstaddr, srcaddr, p4d_dst_next, p4d_src_next))
+        return -ENOMEM;
     if(p4d_src_next - srcaddr > p4d_dst_next - dstaddr) {
       dst_p4d++;
       srcaddr += p4d_dst_next - dstaddr;
@@ -423,12 +421,11 @@ int custom_copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct
   while(srcaddr != srcend && dstaddr != dstend) {
     srcnext = pgd_addr_end(srcaddr, srcend);
     dstnext = pgd_addr_end(dstaddr, dstend);
-    if(pgd_none(*src_pgd) || pgd_bad(*src_pgd)) continue; //probably we should clear bad?
-
-    if(general_copy_p4d_range(dst_vma, src_vma, dst_pgd, src_pgd, dstaddr, srcaddr, dstnext, srcnext)) {
-      ret = -ENOMEM;
-      break;
-    }
+    if(!(pgd_none(*src_pgd) || pgd_bad(*src_pgd)))  //probably we should clear bad?
+      if(general_copy_p4d_range(dst_vma, src_vma, dst_pgd, src_pgd, dstaddr, srcaddr, dstnext, srcnext)) {
+        ret = -ENOMEM;
+        break;
+      }
     if(srcnext - srcaddr > dstnext - dstaddr) {
       dst_pgd++;
       srcaddr += dstnext - dstaddr;
@@ -453,17 +450,21 @@ int custom_copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct
 }
 
 ssize_t process_vm_cowv(const struct pt_regs *regs) {
-  int retval;
-  pid_t pid = regs->di;
+  struct iovec iovstack_l[UIO_FASTIOV];
+  struct iovec iovstack_r[UIO_FASTIOV];
   const __user struct iovec *local_iov = (struct iovec*) regs->si;
-  unsigned long liovcnt = regs->dx;
-  struct iovec *local_iov_kern = kmalloc(sizeof(struct iovec), liovcnt);
   const __user struct iovec *remote_iov = (struct iovec*) regs->r10;
+  unsigned long liovcnt = regs->dx;
   unsigned long riovcnt = regs->r8;
-  struct iovec *remote_iov_kern = kmalloc(sizeof(struct iovec), riovcnt);
+  struct iovec *local_iov_kern = kmalloc(sizeof(struct iovec), liovcnt);//iovstack_l;
+  struct iovec *remote_iov_kern = kmalloc(sizeof(struct iovec), riovcnt);//iovstack_r;
+  struct iov_iter iter;
+  pid_t pid = regs->di;
   struct task_struct* local_task = current;
   struct task_struct* remote_task;
+
   ssize_t copied_count = 0;
+  int retval;
   int i;
   struct vm_area_struct *lvma, *rvma, *prev;
   struct rb_node **rb_link, *rb_parent;
@@ -477,6 +478,9 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
   }
 
   retval = copy_from_user(local_iov_kern, local_iov, liovcnt * sizeof(struct iovec));
+  //retval = import_iovec(READ, local_iov, liovcnt, UIO_FASTIOV, &local_iov_kern, &iter);
+  //if(retval < 0) return retval;
+  //if(!iov_iter_count(&iter)) {kfree(local_iov_kern); return -EINVAL;}
   retval = copy_from_user(remote_iov_kern, remote_iov, riovcnt * sizeof(struct iovec));
   
   remote_task = pid_task(find_vpid(pid), PIDTYPE_PID);
