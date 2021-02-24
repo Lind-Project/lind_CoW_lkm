@@ -15,6 +15,8 @@
 #include <linux/swap.h>
 #include <linux/userfaultfd_k.h>
 #include <linux/pgtable.h>
+#include <linux/swapops.h>
+#include <linux/gfp.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Jonathan Singer");
@@ -59,6 +61,11 @@ typeof(&__vma_link_rb) vmalrb;
 typeof(&lru_cache_add_inactive_or_unevictable) lcaiou;
 typeof(&__mmu_notifier_invalidate_range_start) mnirs;
 typeof(&__mmu_notifier_invalidate_range_end) mnire;
+typeof(&add_swap_count_continuation) ascc;
+typeof(&swap_duplicate) swdup;
+typeof(&cgroup_throttle_swaprate) cgts;
+typeof(&mem_cgroup_charge) mcgc;
+spinlock_t mmll;
 
 //Get address of kallsyms_lookup_name, from https://github.com/zizzu0/LinuxKernelModules
 static int __kprobes pre0(struct kprobe *p, struct pt_regs *regs) {
@@ -124,6 +131,17 @@ static int custom_find_vma_links(struct mm_struct *mm, unsigned long addr, unsig
     return 0;
 }
 
+static inline struct page* custom_page_copy_prealloc(struct mm_struct *src_mm, struct vm_area_struct *vma, unsigned long addr) {
+  struct page *new_page = alloc_page_vma(GFP_HIGHUSER_MOVABLE, vma, addr);
+  if(!new_page) return NULL;
+  if(mcgc(new_page, src_mm, GFP_KERNEL)) {
+    put_page(new_page);
+    return NULL;
+  }
+  cgts(new_page, GFP_KERNEL);
+  return new_page;
+}
+
 static int custom_copy_present_pte(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma, pte_t *dst_pte, pte_t *src_pte, unsigned long dstaddr, unsigned long srcaddr, int *rss, struct page **prealloc) {
   struct mm_struct *src_mm = src_vma->vm_mm;
   unsigned long vm_flags = src_vma->vm_flags;
@@ -173,6 +191,46 @@ page_copied:
   return 0;
 }
 
+static unsigned long custom_copy_nonpresent_pte(struct mm_struct *dst_mm, struct mm_struct* src_mm, pte_t *dst_pte, pte_t *src_pte,  struct vm_area_struct *vma, unsigned long dstaddr, unsigned long srcaddr, int* rss) {
+  unsigned long vm_flags = vma->vm_flags;
+  pte_t pte = *src_pte;
+  struct page *page;
+  swp_entry_t entry = pte_to_swp_entry(pte);
+
+  if(likely(!non_swap_entry(entry))) {
+    if(swdup(entry) < 0) return entry.val;
+    if(unlikely(list_empty(&dst_mm->mmlist))) {
+      spin_lock(&mmll);
+      if(list_empty(&dst_mm->mmlist)) list_add(&dst_mm->mmlist, &src_mm->mmlist);//?
+      spin_unlock(&mmll);
+    }
+    rss[MM_SWAPENTS]++;
+  } else if(is_migration_entry(entry)) {
+    page = migration_entry_to_page(entry);
+    rss[mm_counter(page)]++;
+    if(is_write_migration_entry(entry) && (vm_flags & (VM_SHARED | VM_MAYWRITE)) == VM_MAYWRITE) {
+      make_migration_entry_read(&entry);
+      pte = swp_entry_to_pte(entry);
+      if(pte_swp_soft_dirty(*src_pte)) pte = pte_swp_mksoft_dirty(pte);
+      if(pte_swp_uffd_wp(*src_pte)) pte = pte_swp_mkuffd_wp(pte);
+      set_pte_at(src_mm, srcaddr, src_pte, pte);
+    }
+  } else if(is_device_private_entry(entry)) {
+    page = device_private_entry_to_page(entry);
+    get_page(page);
+    rss[mm_counter(page)]++;
+    page_dup_rmap(page, false);
+    if(is_write_device_private_entry(entry) && (vm_flags & (VM_SHARED | VM_MAYWRITE)) == VM_MAYWRITE) {
+      make_device_private_entry_read(&entry);
+      pte = swp_entry_to_pte(entry);
+      if(pte_swp_uffd_wp(*src_pte)) pte = pte_swp_mkuffd_wp(pte);
+      set_pte_at(src_mm, srcaddr, src_pte, pte);
+    }
+  }
+  set_pte_at(dst_mm, dstaddr, dst_pte, pte);
+  return 0;
+}
+
 static int general_copy_pte_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
 		                  pmd_t *dst_pmd, pmd_t *src_pmd,
 		                  unsigned long dstaddr, unsigned long srcaddr,
@@ -187,6 +245,7 @@ static int general_copy_pte_range(struct vm_area_struct *dst_vma, struct vm_area
   struct mm_struct *dst_mm = dst_vma->vm_mm;
   struct mm_struct *src_mm = src_vma->vm_mm;
 again:
+  if(srcaddr >= srcend || dstaddr >= dstend) return 0;
   progress = 0;
   memset(rss, 0, sizeof(int) * NR_MM_COUNTERS);
 
@@ -204,7 +263,7 @@ again:
   do {
     if(progress >= 32) {
       progress = 0;
-      if(need_resched() || spin_needbreak(src_ptl) || spin_needbreak(dst_ptl)) break;//source of error?
+      if(need_resched() || spin_needbreak(src_ptl) || spin_needbreak(dst_ptl)) break;
     }
     if(pte_none(*src_pte)) {
       progress++;
@@ -212,13 +271,12 @@ again:
     }
     if(unlikely(!pte_present(*src_pte))) {
       printk(KERN_INFO "LINDLKM: copying nonpresent pte\n");
-      break; //we'll need to do copy_nonpresent_pte
-      //entry.val = copy_nonpresent_pte(dst_mm, src_mm, dst_pte, src_pte, src_vma, dstaddr, rss);
+      entry.val = custom_copy_nonpresent_pte(dst_mm, src_mm, dst_pte, src_pte, src_vma, dstaddr, srcaddr, rss);
       if(entry.val) break;
       progress += 8;
       continue;
     }
-    printk(KERN_INFO "LINDLKM: copying present pte %lx %lx\n", dstaddr, srcaddr);
+    printk(KERN_INFO "LINDLKM: copying present pte %lx/%lx %lx/%lx\n", dstaddr, dstend, srcaddr, srcend);
     ret = custom_copy_present_pte(dst_vma, src_vma, dst_pte, src_pte, dstaddr, srcaddr, rss, &prealloc);
     if(unlikely(ret == -EAGAIN)) break;
     if(unlikely(prealloc)) {
@@ -253,15 +311,14 @@ again:
   cond_resched();
 
   if(entry.val) {
-    if(add_swap_count_continuation(entry, GFP_KERNEL) < 0) {
+    if(ascc(entry, GFP_KERNEL) < 0) {
       ret = -ENOMEM;
       goto out;
     }
     entry.val = 0;
   } else if(ret) {
     WARN_ON_ONCE(ret != -EAGAIN);
-    //prealloc = page_copy_prealloc(src_mm, src_vma, srcaddr);
-    //handle page_copy_prealloc
+    prealloc = custom_page_copy_prealloc(src_mm, src_vma, srcaddr); //not 100% sure what this does or whether all src is right
     if(!prealloc) return -ENOMEM; //error out better
     ret = 0;
   }
@@ -517,7 +574,6 @@ anothervma:
 
 
     if(lvma->vm_flags & VM_DONTCOPY) {
-      vmstata(local_task->mm, lvma->vm_flags, -vma_pages(lvma));
       continue;
     }
 
@@ -624,7 +680,7 @@ anothervma:
       remote_task->mm->map_count++;
       //validate_mm(remote_task->mm); we do not validate for now
     } //vma_link
-    vmstata(remote_task->mm, rvma->vm_flags, local_iov_kern[i].iov_len);
+    vmstata(remote_task->mm, rvma->vm_flags, vma_pages(rvma));
     //should more be done? should some be done elsewhere?
 
     if(!(rvma->vm_flags & VM_WIPEONFORK)) {
@@ -722,6 +778,11 @@ static int __init cowcall_init(void) {
   lcaiou = (typeof(&lru_cache_add_inactive_or_unevictable)) kln("lru_cache_add_inactive_or_unevictable");
   mnirs = (typeof(&__mmu_notifier_invalidate_range_start)) kln("__mmu_notifier_invalidate_range_start");
   mnire = (typeof(&__mmu_notifier_invalidate_range_end)) kln("__mmu_notifier_invalidate_range_end");
+  ascc = (typeof(&add_swap_count_continuation)) kln("add_swap_count_continuation");
+  swdup = (typeof(&swap_duplicate)) kln("swap_duplicate");
+  cgts = (typeof(&cgroup_throttle_swaprate)) kln("cgroup_throttle_swaprate");
+  mcgc = (typeof(&mem_cgroup_charge)) kln("mem_cgroup_charge");
+  mmll = *(spinlock_t*) kln("mmlist_lock");
   return 0;
 }
 
