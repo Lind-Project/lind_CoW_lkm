@@ -276,7 +276,7 @@ again:
       progress += 8;
       continue;
     }
-    printk(KERN_INFO "LINDLKM: copying present pte %lx/%lx %lx/%lx\n", dstaddr, dstend, srcaddr, srcend);
+    //printk(KERN_INFO "LINDLKM: copying present pte %lx/%lx %lx/%lx\n", dstaddr, dstend, srcaddr, srcend);
     ret = custom_copy_present_pte(dst_vma, src_vma, dst_pte, src_pte, dstaddr, srcaddr, rss, &prealloc);
     if(unlikely(ret == -EAGAIN)) break;
     if(unlikely(prealloc)) {
@@ -526,10 +526,9 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
   struct vm_area_struct *lvma, *rvma, *prev;
   struct rb_node **rb_link, *rb_parent;
   LIST_HEAD(uf);
-  //ignore flags
-  //TODO: ERSCH and EPERM support
+  //ESRCH and EPERM support for multiple mappings?
 
-  if(liovcnt != riovcnt) {
+  if(liovcnt != riovcnt || liovcnt > UIO_MAXIOV) {
     retval = -EINVAL;
     goto out;
   }
@@ -688,9 +687,9 @@ anothervma:
     }
     if(rvma->vm_ops && rvma->vm_ops->open)
       rvma->vm_ops->open(rvma);
-    if(retval) ;//TODO: error out in some not braindead way
+    if(retval) goto mpolout;//TODO: error out in some not braindead way
     retval = ivs(remote_task->mm, rvma);
-    if(retval) ;//TODO: error out in some not braindead way
+    if(retval) goto mpolout;//TODO: error out in some not braindead way
     copied_count += local_iov_kern[i].iov_len;
     ftmr(local_task->mm, lvma->vm_start, lvma->vm_end, PAGE_SHIFT, false);
     if(localstart < localend) goto anothervma;
@@ -698,7 +697,7 @@ anothervma:
   dufdc(&uf);
   kfree(local_iov_kern);
   kfree(remote_iov_kern);
-  if(copied_count == 0) return -1;//TODO: error better here?
+  if(copied_count == 0) return -EINVAL;//TODO: error better here?
   return copied_count;
 mpolout:
   cmpol_put(vma_policy(rvma));
