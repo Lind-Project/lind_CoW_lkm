@@ -133,10 +133,8 @@ static int custom_find_vma_links(struct mm_struct *mm, unsigned long addr, unsig
 }
 
 static inline int custom_munmap_vma_range(struct mm_struct *mm, unsigned long start, unsigned long len, struct vm_area_struct **pprev, struct rb_node ***link, struct rb_node **parent, struct list_head *uf) {
-  printk(KERN_INFO "LINDLKM: unmapping %lx with length of %lx\n", start, len);
   while(custom_find_vma_links(mm, start, start + len, pprev, link, parent))
     if(dmm(mm, start, len, uf)) return -ENOMEM;
-  printk(KERN_INFO "LINDLKM: finished unmapping %lx with length of %lx\n", start, len);
   return 0;
 }
 
@@ -285,7 +283,6 @@ again:
       progress += 8;
       continue;
     }
-    //printk(KERN_INFO "LINDLKM: copying present pte %lx/%lx %lx/%lx\n", dstaddr, dstend, srcaddr, srcend);
     ret = custom_copy_present_pte(dst_vma, src_vma, dst_pte, src_pte, dstaddr, srcaddr, rss, &prealloc);
     if(unlikely(ret == -EAGAIN)) break;
     if(unlikely(prealloc)) {
@@ -555,11 +552,12 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
       printk(KERN_INFO "LINDLKM: different lengths\n");
       goto out;
     }
-    //if(custom_munmap_vma_range(remote_task->mm, (unsigned long) remote_iov_kern[i].iov_base, 
-    //                           remote_iov_kern[i].iov_len, &prev, &rb_link, &rb_parent, &uf)) {
-    //  retval = -ENOMEM;
-    //  goto out;
-    //}
+    printk(KERN_INFO "LINDLKM: %d %ld %ld mapping\n", i, (unsigned long) remote_iov_kern[i].iov_base, remote_iov_kern[i].iov_len);
+    if(custom_munmap_vma_range(remote_task->mm, (unsigned long) remote_iov_kern[i].iov_base, 
+                               remote_iov_kern[i].iov_len, &prev, &rb_link, &rb_parent, &uf)) {
+      retval = -ENOMEM;
+      goto out;
+    }
   }
   for(i = 0; i < liovcnt; i++) {
     unsigned int charge;
@@ -688,9 +686,9 @@ anothervma:
     }
     if(rvma->vm_ops && rvma->vm_ops->open)
       rvma->vm_ops->open(rvma);
-    if(retval) goto mpolout;//TODO: error out in some not braindead way
+    if(retval) ;//goto mpolout;//TODO: error out in some not braindead way
     retval = ivs(remote_task->mm, rvma);
-    if(retval) goto mpolout;//TODO: error out in some not braindead way
+    if(retval) ;//goto mpolout;//TODO: error out in some not braindead way
     copied_count += local_iov_kern[i].iov_len;
     ftmr(local_task->mm, lvma->vm_start, lvma->vm_end, PAGE_SHIFT, false);
     if(localstart < localend) goto anothervma;
