@@ -65,6 +65,7 @@ typeof(&add_swap_count_continuation) ascc;
 typeof(&swap_duplicate) swdup;
 typeof(&cgroup_throttle_swaprate) cgts;
 typeof(&mem_cgroup_charge) mcgc;
+typeof(&do_munmap) dmm;
 spinlock_t mmll;
 
 //Get address of kallsyms_lookup_name, from https://github.com/zizzu0/LinuxKernelModules
@@ -129,6 +130,14 @@ static int custom_find_vma_links(struct mm_struct *mm, unsigned long addr, unsig
     *rb_link = __rb_link;
     *rb_parent = __rb_parent;
     return 0;
+}
+
+static inline int custom_munmap_vma_range(struct mm_struct *mm, unsigned long start, unsigned long len, struct vm_area_struct **pprev, struct rb_node ***link, struct rb_node **parent, struct list_head *uf) {
+  printk(KERN_INFO "LINDLKM: unmapping %lx with length of %lx\n", start, len);
+  while(custom_find_vma_links(mm, start, start + len, pprev, link, parent))
+    if(dmm(mm, start, len, uf)) return -ENOMEM;
+  printk(KERN_INFO "LINDLKM: finished unmapping %lx with length of %lx\n", start, len);
+  return 0;
 }
 
 static inline struct page* custom_page_copy_prealloc(struct mm_struct *src_mm, struct vm_area_struct *vma, unsigned long addr) {
@@ -339,7 +348,7 @@ static int general_copy_pmd_range(struct vm_area_struct *dst_vma, struct vm_area
   if(!dst_pmd) return -ENOMEM;
   src_pmd = pmd_offset(src_pud, srcaddr);
   while(srcaddr != srcend && dstaddr != dstend) {
-    printk(KERN_INFO "LINDLKM: copying pmd range %lx %lx %p %p\n", srcaddr, dstaddr, src_pmd, dst_pmd);
+    //printk(KERN_INFO "LINDLKM: copying pmd range %lx %lx %p %p\n", srcaddr, dstaddr, src_pmd, dst_pmd);
     pmd_src_next = pmd_addr_end(srcaddr, srcend);
     pmd_dst_next = pmd_addr_end(dstaddr, dstend);
     if(pmd_trans_huge(*src_pmd) || pmd_devmap(*src_pmd)) break; //we don't deal with hugepages
@@ -546,19 +555,11 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
       printk(KERN_INFO "LINDLKM: different lengths\n");
       goto out;
     }
-    if(find_vma_intersection(remote_task->mm, (unsigned long) remote_iov_kern[i].iov_base, 
-         (unsigned long) (remote_iov_kern[i].iov_base + remote_iov_kern[i].iov_len))) {
-      retval = -EFAULT;
-      printk(KERN_INFO "LINDLKM: they intersect??\n");
-      goto out;
-    }
-    //if(!find_exact_vma(local_task->mm, (unsigned long) local_iov_kern[i].iov_base, 
-    //        (unsigned long) (local_iov_kern[i].iov_base + local_iov_kern[i].iov_len))) {
-    //  retval = -EFAULT;
-    //  printk(KERN_INFO "LINDLKM: there's no exact vma.\n");
+    //if(custom_munmap_vma_range(remote_task->mm, (unsigned long) remote_iov_kern[i].iov_base, 
+    //                           remote_iov_kern[i].iov_len, &prev, &rb_link, &rb_parent, &uf)) {
+    //  retval = -ENOMEM;
     //  goto out;
     //}
-    //find vmas in a different way
   }
   for(i = 0; i < liovcnt; i++) {
     unsigned int charge;
@@ -781,6 +782,7 @@ static int __init cowcall_init(void) {
   swdup = (typeof(&swap_duplicate)) kln("swap_duplicate");
   cgts = (typeof(&cgroup_throttle_swaprate)) kln("cgroup_throttle_swaprate");
   mcgc = (typeof(&mem_cgroup_charge)) kln("mem_cgroup_charge");
+  dmm = (typeof(&do_munmap)) kln("do_munmap");
   mmll = *(spinlock_t*) kln("mmlist_lock");
   return 0;
 }
