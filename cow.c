@@ -32,17 +32,19 @@ MODULE_VERSION("0.1");
 #define pte_alloc(mm, pmd) (unlikely(pmd_none(*(pmd))) && ptea(mm, pmd))
 #define cmpol_put(p) if(p) mpp(p)
 
+//for syscall table juggling
 void* klnaddr;
 unsigned long (*kln)(const char* name);
 unsigned long* syscall_table;
 ssize_t (*old_vm_writev)(const struct pt_regs*);
 
+//declarations to be populated by kallsyms lookup name
 typeof(&reset_vma_resv_huge_pages) rvhp;
 typeof(&anon_vma_fork) avf;
 typeof(&track_pfn_copy) tpc;
 typeof(&vma_interval_tree_insert_after) vitia;
 typeof(&vma_interval_tree_insert) viti;
-void (*ftmr)(struct mm_struct*, unsigned long, unsigned long, unsigned int, bool);
+void (*ftmr)(struct mm_struct*, unsigned long, unsigned long, unsigned int, bool);//typeof didn't work
 typeof(&__p4d_alloc) p4da;
 typeof(&__pud_alloc) puda;
 typeof(&__pmd_alloc) pmda;
@@ -83,6 +85,15 @@ static void do_register_kprobe(struct kprobe *kp, char *symbol_name, void* handl
   register_kprobe(kp);
 }
 
+static void lookup_lookup_name(void) {
+  struct kprobe kp0, kp1;
+  do_register_kprobe(&kp0, "kallsyms_lookup_name", pre0);
+  do_register_kprobe(&kp1, "kallsyms_lookup_name", pre1);
+  unregister_kprobe(&kp0);
+  unregister_kprobe(&kp1);
+  kln = (unsigned long(*)(const char*))klnaddr;
+}
+
 static inline void custom_mmu_notifier_invalidate_range_start(struct mmu_notifier_range* range) {
   might_sleep();
   lock_map_acquire(&__mmu_notifier_invalidate_range_start_map);
@@ -95,16 +106,6 @@ static inline void custom_mmu_notifier_invalidate_range_start(struct mmu_notifie
 static inline void custom_mmu_notifier_invalidate_range_end(struct mmu_notifier_range* range) {
   if(mmu_notifier_range_blockable(range)) might_sleep();
   if(mm_has_notifiers(range->mm)) mnire(range, false);
-}
-
-
-static void lookup_lookup_name(void) {
-  struct kprobe kp0, kp1;
-  do_register_kprobe(&kp0, "kallsyms_lookup_name", pre0);
-  do_register_kprobe(&kp1, "kallsyms_lookup_name", pre1);
-  unregister_kprobe(&kp0);
-  unregister_kprobe(&kp1);
-  kln = (unsigned long(*)(const char*))klnaddr;
 }
 
 static int custom_find_vma_links(struct mm_struct *mm, unsigned long addr, unsigned long end, struct vm_area_struct **pprev, struct rb_node ***rb_link, struct rb_node **rb_parent) {
@@ -133,7 +134,55 @@ static int custom_find_vma_links(struct mm_struct *mm, unsigned long addr, unsig
     return 0;
 }
 
-static inline int custom_munmap_vma_range(struct mm_struct *mm, unsigned long start, unsigned long len, struct vm_area_struct **pprev, struct rb_node ***link, struct rb_node **parent, struct list_head *uf) {
+
+static void custom_vma_link(struct vm_area_struct* rvma) {
+  struct file *mapfile;
+  struct address_space *mapping = NULL;
+  struct mm_struct* memm = rvma->vm_mm;
+  struct vm_area_struct *prev;
+  struct rb_node **rb_link, *rb_parent;
+
+  if(rvma->vm_file) {
+    mapping = rvma->vm_file->f_mapping;
+    i_mmap_lock_write(mapping);
+  }
+  custom_find_vma_links(memm, rvma->vm_start, rvma->vm_end, &prev, &rb_link, &rb_parent);
+  {
+    struct vm_area_struct *next;
+    rvma->vm_prev =  prev;
+    if(prev) {
+      next = prev->vm_next;
+      prev->vm_next = rvma;
+    } else {
+      next = memm->mmap;
+      memm->mmap = rvma;
+    }
+    rvma->vm_next = next;
+    if(next) next->vm_prev = rvma;
+  } //__vma_link_list(remote_task->mm, rvma, prev);
+
+  vmalrb(memm, rvma, rb_link, rb_parent);
+
+  mapfile = rvma->vm_file;
+  if(mapfile) {
+    struct address_space *filemapping = mapfile->f_mapping;
+    if(rvma->vm_flags & VM_DENYWRITE)
+      put_write_access(file_inode(mapfile));
+    if(rvma->vm_flags & VM_SHARED)
+      mapping_allow_writable(filemapping);
+    flush_dcache_mmap_lock(filemapping);
+    viti(rvma, &filemapping->i_mmap);
+    flush_dcache_mmap_unlock(filemapping);
+  } //__vma_link_file
+
+  if(mapping) i_mmap_unlock_write(mapping);
+  memm->map_count++;
+  //validate_mm(memm); //we do not validate
+} //vma_link
+
+static inline int custom_munmap_vma_range(struct mm_struct *mm, unsigned long start, unsigned long len, 
+		                          struct vm_area_struct **pprev, struct rb_node ***link, 
+					  struct rb_node **parent, struct list_head *uf) {
   while(custom_find_vma_links(mm, start, start + len, pprev, link, parent)) {
     int unmapval = dmm(mm, start, len, uf);
     if(unmapval) return unmapval;
@@ -152,7 +201,9 @@ static inline struct page* custom_page_copy_prealloc(struct mm_struct *src_mm, s
   return new_page;
 }
 
-static int custom_copy_present_pte(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma, pte_t *dst_pte, pte_t *src_pte, unsigned long dstaddr, unsigned long srcaddr, int *rss, struct page **prealloc) {
+static int custom_copy_present_pte(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma, 
+		                   pte_t *dst_pte, pte_t *src_pte, unsigned long dstaddr, unsigned long srcaddr, 
+				   int *rss, struct page **prealloc) {
   struct mm_struct *src_mm = src_vma->vm_mm;
   unsigned long vm_flags = src_vma->vm_flags;
   pte_t pte = *src_pte;
@@ -160,15 +211,16 @@ static int custom_copy_present_pte(struct vm_area_struct *dst_vma, struct vm_are
 
   page = vnp(src_vma, srcaddr, pte);
   if(page) {
-    int retval;
-
     //copy_present_page
     struct page *new_page;
-    if(!((vm_flags & (VM_SHARED | VM_MAYWRITE)) == VM_MAYWRITE)) {retval = 1; goto page_copied;}
-    if(likely(!atomic_read(&src_mm->has_pinned))) {retval = 1; goto page_copied;}
-    if(likely(!page_maybe_dma_pinned(page))) {retval = 1; goto page_copied;}
+    if(!((vm_flags & (VM_SHARED | VM_MAYWRITE)) == VM_MAYWRITE)) goto page_copied;
+    if(likely(!atomic_read(&src_mm->has_pinned))) goto page_copied;
+    if(likely(!page_maybe_dma_pinned(page))) goto page_copied;
+
+    //otherwise manually assign+copy preallocated page at pte
+    //if none exists, return with -EAGAIN so that calling code can allocate one
     new_page = *prealloc;
-    if(!new_page) {retval = -EAGAIN; goto page_copied;}
+    if(!new_page) return -EAGAIN;
     *prealloc = NULL;
     copy_user_highpage(new_page, page, dstaddr, src_vma);
     __SetPageUptodate(new_page);
@@ -180,9 +232,8 @@ static int custom_copy_present_pte(struct vm_area_struct *dst_vma, struct vm_are
     pte = maybe_mkwrite(pte_mkdirty(pte), dst_vma);
     set_pte_at(dst_vma->vm_mm, dstaddr, dst_pte, pte);
     return 0;
-page_copied:
 
-    if(retval <= 0) return retval;
+page_copied:
     get_page(page);
     page_dup_rmap(page, false);
     rss[mm_counter(page)]++;
@@ -201,7 +252,9 @@ page_copied:
   return 0;
 }
 
-static unsigned long custom_copy_nonpresent_pte(struct mm_struct *dst_mm, struct mm_struct* src_mm, pte_t *dst_pte, pte_t *src_pte,  struct vm_area_struct *vma, unsigned long dstaddr, unsigned long srcaddr, int* rss) {
+static unsigned long custom_copy_nonpresent_pte(struct mm_struct *dst_mm, struct mm_struct* src_mm, 
+		                                pte_t *dst_pte, pte_t *src_pte, struct vm_area_struct *vma, 
+						unsigned long dstaddr, unsigned long srcaddr, int* rss) {
   unsigned long vm_flags = vma->vm_flags;
   pte_t pte = *src_pte;
   struct page *page;
@@ -211,7 +264,7 @@ static unsigned long custom_copy_nonpresent_pte(struct mm_struct *dst_mm, struct
     if(swdup(entry) < 0) return entry.val;
     if(unlikely(list_empty(&dst_mm->mmlist))) {
       spin_lock(&mmll);
-      if(list_empty(&dst_mm->mmlist)) list_add(&dst_mm->mmlist, &src_mm->mmlist);//?
+      if(list_empty(&dst_mm->mmlist)) list_add(&dst_mm->mmlist, &src_mm->mmlist);
       spin_unlock(&mmll);
     }
     rss[MM_SWAPENTS]++;
@@ -280,7 +333,6 @@ again:
       continue;
     }
     if(unlikely(!pte_present(*src_pte))) {
-      printk(KERN_INFO "LINDLKM: copying nonpresent pte\n");
       entry.val = custom_copy_nonpresent_pte(dst_mm, src_mm, dst_pte, src_pte, src_vma, dstaddr, srcaddr, rss);
       if(entry.val) break;
       progress += 8;
@@ -327,8 +379,8 @@ again:
     entry.val = 0;
   } else if(ret) {
     WARN_ON_ONCE(ret != -EAGAIN);
-    prealloc = custom_page_copy_prealloc(src_mm, src_vma, srcaddr); //not 100% sure what this does or whether all src is right
-    if(!prealloc) return -ENOMEM; //error out better
+    prealloc = custom_page_copy_prealloc(src_mm, src_vma, srcaddr);
+    if(!prealloc) return -ENOMEM;
     ret = 0;
   }
   if(srcaddr != srcend) goto again;
@@ -344,31 +396,29 @@ static int general_copy_pmd_range(struct vm_area_struct *dst_vma, struct vm_area
   struct mm_struct *dst_mm = dst_vma->vm_mm;
   pmd_t *src_pmd, *dst_pmd;
   unsigned long pmd_src_next, pmd_dst_next;
+  int ret;
   dst_pmd = pmdalloc(dst_mm, dst_pud, dstaddr);
   if(!dst_pmd) return -ENOMEM;
   src_pmd = pmd_offset(src_pud, srcaddr);
   while(srcaddr != srcend && dstaddr != dstend) {
-    //printk(KERN_INFO "LINDLKM: copying pmd range %lx %lx %p %p\n", srcaddr, dstaddr, src_pmd, dst_pmd);
     pmd_src_next = pmd_addr_end(srcaddr, srcend);
     pmd_dst_next = pmd_addr_end(dstaddr, dstend);
-    if(pmd_trans_huge(*src_pmd) || pmd_devmap(*src_pmd)) break; //we don't deal with hugepages
-    if(is_swap_pmd(*src_pmd)) ; //not sure how to handle swapped out pages?
+    if(is_swap_pmd(*src_pmd) || pmd_trans_huge(*src_pmd) || pmd_devmap(*src_pmd))
+      return -EINVAL;
     if(!(pmd_none(*src_pmd) || pmd_bad(*src_pmd)))
-      if(general_copy_pte_range(dst_vma, src_vma, dst_pmd, src_pmd, dstaddr, srcaddr, pmd_dst_next, pmd_src_next))
-        return -ENOMEM;
+      if((ret = general_copy_pte_range(dst_vma, src_vma, dst_pmd, src_pmd, dstaddr, srcaddr, pmd_dst_next, pmd_src_next)))
+        return ret;
     if(pmd_src_next - srcaddr > pmd_dst_next - dstaddr) {
       dst_pmd++;
       srcaddr += pmd_dst_next - dstaddr;
       dstaddr = pmd_dst_next;
-      continue;
-    }
-    if(pmd_src_next - srcaddr < pmd_dst_next - dstaddr) {
+    } else if(pmd_src_next - srcaddr < pmd_dst_next - dstaddr) {
       src_pmd++;
       dstaddr += pmd_src_next - srcaddr;
       srcaddr = pmd_src_next;
-      continue;
+    } else {
+      dst_pmd++, src_pmd++, srcaddr = pmd_src_next, dstaddr = pmd_dst_next;
     }
-    dst_pmd++, src_pmd++, srcaddr = pmd_src_next, dstaddr = pmd_dst_next;
   }
 
   return 0;
@@ -379,34 +429,31 @@ static int general_copy_pud_range(struct vm_area_struct *dst_vma, struct vm_area
                                   unsigned long dstaddr, unsigned long srcaddr,
                                   unsigned long dstend, unsigned long srcend) {
   struct mm_struct *dst_mm = dst_vma->vm_mm;
-  struct mm_struct *src_mm = src_vma->vm_mm;
   pud_t *src_pud, *dst_pud;
+  int ret;
   unsigned long pud_src_next, pud_dst_next;
-  (void) src_mm;
   dst_pud = pudalloc(dst_mm, dst_p4d, dstaddr);
   if(!dst_pud) return -ENOMEM;
   src_pud = pud_offset(src_p4d, srcaddr);
-  printk(KERN_INFO "LINDLKM: copying pud range %lx %lx %p %p\n", srcaddr, dstaddr, src_pud, dst_pud);
   while(srcaddr != srcend && dstaddr != dstend) {
     pud_src_next = pud_addr_end(srcaddr, srcend);
     pud_dst_next = pud_addr_end(dstaddr, dstend);
-    if(pud_trans_huge(*src_pud) || pud_devmap(*src_pud)) break; //error out better, we don't support hugetlb pages
+    if(pud_trans_huge(*src_pud) || pud_devmap(*src_pud)) 
+      return -EINVAL;
     if(!(pud_none(*src_pud) || pud_bad(*src_pud)))
-      if(general_copy_pmd_range(dst_vma, src_vma, dst_pud, src_pud, dstaddr, srcaddr, pud_dst_next, pud_src_next))
-        return -ENOMEM;
+      if((ret = general_copy_pmd_range(dst_vma, src_vma, dst_pud, src_pud, dstaddr, srcaddr, pud_dst_next, pud_src_next)))
+        return ret;
     if(pud_src_next - srcaddr > pud_dst_next - dstaddr) {
       dst_pud++;
       srcaddr += pud_dst_next - dstaddr;
       dstaddr = pud_dst_next;
-      continue;
-    }
-    if(pud_src_next - srcaddr < pud_dst_next - dstaddr) {
+    } else if(pud_src_next - srcaddr < pud_dst_next - dstaddr) {
       src_pud++;
       dstaddr += pud_src_next - srcaddr;
       srcaddr = pud_src_next;
-      continue;
+    } else {
+      dst_pud++, src_pud++, srcaddr = pud_src_next, dstaddr = pud_dst_next;
     }
-    dst_pud++, src_pud++, srcaddr = pud_src_next, dstaddr = pud_dst_next;
   }
   return 0;
 }
@@ -416,40 +463,66 @@ static int general_copy_p4d_range(struct vm_area_struct *dst_vma, struct vm_area
                                   unsigned long dstaddr, unsigned long srcaddr,
                                   unsigned long dstend, unsigned long srcend) {
   struct mm_struct *dst_mm = dst_vma->vm_mm;
-  struct mm_struct *src_mm = src_vma->vm_mm;
   p4d_t *src_p4d, *dst_p4d;
+  int ret;
   unsigned long p4d_src_next, p4d_dst_next;
-  (void) src_mm;
   dst_p4d = p4dalloc(dst_mm, dst_pgd, dstaddr);
   if(!dst_p4d) return -ENOMEM;
   src_p4d = p4d_offset(src_pgd, srcaddr);
   while(srcaddr != srcend && dstaddr != dstend) {
     p4d_src_next = p4d_addr_end(srcaddr, srcend);
     p4d_dst_next = p4d_addr_end(dstaddr, dstend);
-    printk(KERN_INFO "LINDLKM: copying p4d range %lx %lx %p %p\n", srcaddr, dstaddr, src_p4d, dst_p4d);
     if(!(p4d_none(*src_p4d) || p4d_bad(*src_p4d)))
-      if(general_copy_pud_range(dst_vma, src_vma, dst_p4d, src_p4d, dstaddr, srcaddr, p4d_dst_next, p4d_src_next))
-        return -ENOMEM;
+      if((ret = general_copy_pud_range(dst_vma, src_vma, dst_p4d, src_p4d, dstaddr, srcaddr, p4d_dst_next, p4d_src_next)))
+        return ret;
     if(p4d_src_next - srcaddr > p4d_dst_next - dstaddr) {
       dst_p4d++;
       srcaddr += p4d_dst_next - dstaddr;
       dstaddr = p4d_dst_next;
-      continue;
-    }
-    if(p4d_src_next - srcaddr < p4d_dst_next - dstaddr) {
+    } else if(p4d_src_next - srcaddr < p4d_dst_next - dstaddr) {
       src_p4d++;
       dstaddr += p4d_src_next - srcaddr;
       srcaddr = p4d_src_next;
-      continue;
+    } else {
+      dst_p4d++, src_p4d++, srcaddr = p4d_src_next, dstaddr = p4d_dst_next;
     }
-    dst_p4d++, src_p4d++, srcaddr = p4d_src_next, dstaddr = p4d_dst_next;
   }
   return 0;
 }
 
-int custom_copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma, unsigned long dstaddr, unsigned long dstend, unsigned long srcaddr, unsigned long srcend) {
-  pgd_t *src_pgd, *dst_pgd;
+static int general_copy_pgd_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
+                                  unsigned long dstaddr, unsigned long srcaddr,
+                                  unsigned long dstend, unsigned long srcend) {
   unsigned long srcnext, dstnext;
+  struct mm_struct *dst_mm = dst_vma->vm_mm;
+  struct mm_struct *src_mm = src_vma->vm_mm;
+  pgd_t *src_pgd = pgd_offset(src_mm, srcaddr);
+  pgd_t *dst_pgd = pgd_offset(dst_mm, dstaddr);
+  int ret;
+  while(srcaddr != srcend && dstaddr != dstend) {
+    srcnext = pgd_addr_end(srcaddr, srcend);
+    dstnext = pgd_addr_end(dstaddr, dstend);
+    if(!(pgd_none(*src_pgd) || pgd_bad(*src_pgd)))  //probably we should clear bad?
+      if((ret = general_copy_p4d_range(dst_vma, src_vma, dst_pgd, src_pgd, dstaddr, srcaddr, dstnext, srcnext)))
+        return ret;
+    if(srcnext - srcaddr > dstnext - dstaddr) {
+      dst_pgd++;
+      srcaddr += dstnext - dstaddr;
+      dstaddr = dstnext;
+    } else if(srcnext - srcaddr < dstnext - dstaddr) {
+      src_pgd++;
+      dstaddr += srcnext - srcaddr;
+      srcaddr = srcnext;
+    } else {
+      dst_pgd++, src_pgd++, srcaddr = srcnext, dstaddr = dstnext;
+    }
+  }
+  return 0;
+}
+
+int custom_copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
+		           unsigned long dstaddr, unsigned long srcaddr,
+			   unsigned long dstend, unsigned long srcend) {
   struct mm_struct *dst_mm = dst_vma->vm_mm;
   struct mm_struct *src_mm = src_vma->vm_mm;
   struct mmu_notifier_range range;
@@ -459,7 +532,7 @@ int custom_copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct
   if(!(src_vma->vm_flags & (VM_HUGETLB | VM_PFNMAP | VM_MIXEDMAP)) && !src_vma->anon_vma)
     return 0;
   if(is_vm_hugetlb_page(src_vma))
-    return 0; //we don't handle hugetlb pages yet
+    return -EINVAL;
   if(unlikely(src_vma->vm_flags & VM_PFNMAP)) {
     ret = tpc(src_vma);
     if(ret) return ret;
@@ -470,38 +543,12 @@ int custom_copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct
   if(is_cow) {
     mmu_notifier_range_init(&range, MMU_NOTIFY_PROTECTION_PAGE, 0, src_vma, src_mm, srcaddr, srcend);
     custom_mmu_notifier_invalidate_range_start(&range);
-    //mmap_assert_write_locked(src_mm);
+    lockdep_assert_held_write(src_mm->mmap_lock);//mmap_assert_write_locked(src_mm);
     raw_write_seqcount_begin(&src_mm->write_protect_seq);
   }
 
-  ret = 0;
-
-  dst_pgd = pgd_offset(dst_mm, dstaddr);
-  src_pgd = pgd_offset(src_mm, srcaddr);
-  printk(KERN_INFO "LINDLKM: offsets calculated\n");
-
-  while(srcaddr != srcend && dstaddr != dstend) {
-    srcnext = pgd_addr_end(srcaddr, srcend);
-    dstnext = pgd_addr_end(dstaddr, dstend);
-    if(!(pgd_none(*src_pgd) || pgd_bad(*src_pgd)))  //probably we should clear bad?
-      if(general_copy_p4d_range(dst_vma, src_vma, dst_pgd, src_pgd, dstaddr, srcaddr, dstnext, srcnext)) {
-        ret = -ENOMEM;
-        break;
-      }
-    if(srcnext - srcaddr > dstnext - dstaddr) {
-      dst_pgd++;
-      srcaddr += dstnext - dstaddr;
-      dstaddr = dstnext;
-      continue;
-    }
-    if(srcnext - srcaddr < dstnext - dstaddr) {
-      src_pgd++;
-      dstaddr += srcnext - srcaddr;
-      srcaddr = srcnext;
-      continue;
-    }
-    dst_pgd++, src_pgd++, srcaddr = srcnext, dstaddr = dstnext;
-  }
+  if((ret = general_copy_pgd_range(dst_vma, src_vma, dstaddr, srcaddr, dstend, srcend)))
+    return ret;
 
   if(is_cow) {
     raw_write_seqcount_end(&src_mm->write_protect_seq);
@@ -512,15 +559,12 @@ int custom_copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct
 }
 
 ssize_t process_vm_cowv(const struct pt_regs *regs) {
-  struct iovec iovstack_l[UIO_FASTIOV];
-  struct iovec iovstack_r[UIO_FASTIOV];
   const __user struct iovec *local_iov = (struct iovec*) regs->si;
   const __user struct iovec *remote_iov = (struct iovec*) regs->r10;
   unsigned long liovcnt = regs->dx;
   unsigned long riovcnt = regs->r8;
-  struct iovec *local_iov_kern = kmalloc(sizeof(struct iovec) * liovcnt, GFP_KERNEL);//iovstack_l;
-  struct iovec *remote_iov_kern = kmalloc(sizeof(struct iovec) * riovcnt, GFP_KERNEL);//iovstack_r;
-  struct iov_iter iter;
+  struct iovec *local_iov_kern = kmalloc(sizeof(struct iovec) * liovcnt, GFP_KERNEL);
+  struct iovec *remote_iov_kern = kmalloc(sizeof(struct iovec) * riovcnt, GFP_KERNEL);
   pid_t pid = regs->di;
   struct task_struct* local_task = current;
   struct task_struct* remote_task;
@@ -531,30 +575,27 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
   struct vm_area_struct *lvma, *rvma, *prev;
   struct rb_node **rb_link, *rb_parent;
   LIST_HEAD(uf);
-  //ESRCH and EPERM support for multiple mappings?
 
   if(liovcnt != riovcnt || liovcnt > UIO_MAXIOV) {
     retval = -EINVAL;
     goto out;
   }
 
-  retval = copy_from_user(local_iov_kern, local_iov, liovcnt * sizeof(struct iovec));
-  //retval = import_iovec(READ, local_iov, liovcnt, UIO_FASTIOV, &local_iov_kern, &iter);
-  //if(retval < 0) return retval;
-  //if(!iov_iter_count(&iter)) {kfree(local_iov_kern); return -EINVAL;}
-  retval = copy_from_user(remote_iov_kern, remote_iov, riovcnt * sizeof(struct iovec));
+  if(copy_from_user(local_iov_kern, local_iov, liovcnt * sizeof(struct iovec))) {
+    retval = -EFAULT;
+    goto out;
+  }
+  if(copy_from_user(remote_iov_kern, remote_iov, riovcnt * sizeof(struct iovec))) {
+    retval = -EFAULT;
+    goto out;
+  }
   
   remote_task = pid_task(find_vpid(pid), PIDTYPE_PID);
   for(i = 0; i < liovcnt; i++) {
     if(local_iov_kern[i].iov_len != remote_iov_kern[i].iov_len) {
       retval = -EINVAL;
-      printk(KERN_INFO "LINDLKM: different lengths\n");
+      printk(KERN_INFO "LINDLKM: error in iovecs input, corresponding elements are different lengths\n");
       goto out;
-    }
-    printk(KERN_INFO "LINDLKM: %d %ld %ld mapping\n", i, (unsigned long) remote_iov_kern[i].iov_base, remote_iov_kern[i].iov_len);
-    if((retval = custom_munmap_vma_range(remote_task->mm, (unsigned long) remote_iov_kern[i].iov_base, 
-                                         remote_iov_kern[i].iov_len, &prev, &rb_link, &rb_parent, &uf))) {
-      return retval;
     }
   }
   for(i = 0; i < liovcnt; i++) {
@@ -563,32 +604,36 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
     unsigned long localend = localstart + local_iov_kern[i].iov_len;
     unsigned long remotestart = (unsigned long)remote_iov_kern[i].iov_base;
     unsigned long remoteend = remotestart + remote_iov_kern[i].iov_len;
+
+    if((retval = custom_munmap_vma_range(remote_task->mm, (unsigned long) remotestart, remote_iov_kern[i].iov_len, &prev, &rb_link, &rb_parent, &uf))) {
+      retval = -EINVAL;
+      goto out;
+    }
+
     rvma = NULL;
 anothervma:
     lvma = find_vma_intersection(local_task->mm, localstart, localend);
-
 
     if(lvma->vm_flags & VM_DONTCOPY) {
       continue;
     }
 
-
     if(fatal_signal_pending(current)) {
       retval = -EINTR;
-      goto out;
+      goto undoall_norvma;
     }
     if(lvma->vm_flags & VM_ACCOUNT) {
       unsigned long len = vma_pages(lvma);
       if(svmemm(local_task->mm, len)) {
         retval = -ENOMEM;
-        goto out;
+        goto undoall_norvma;
       }
     }
 
     rvma = vmad(lvma);
     if(!rvma) {
       retval = -ENOMEM;
-      goto out;
+      goto undoall_norvma;
     }
     rvma->vm_start = (long unsigned) remote_iov_kern[i].iov_base;
     rvma->vm_end = rvma->vm_start + remote_iov_kern[i].iov_len;
@@ -596,14 +641,14 @@ anothervma:
     retval = vmadpol(lvma, rvma);
     if(retval) {
       retval = -ENOMEM;
-      goto out;
+      goto undoall;
     }
     rvma->vm_mm = remote_task->mm;
 
-    retval = dufd(rvma, &uf); //does this need to be done??
+    retval = dufd(rvma, &uf);
     if(retval) {
       retval = -ENOMEM;
-      goto mpolout;
+      goto undoall;
     }
 
     if(rvma->vm_flags & VM_WIPEONFORK)
@@ -631,62 +676,19 @@ anothervma:
     if(is_vm_hugetlb_page(rvma))
       goto mpolout; //hugetlb pages are not supported!
 
-    {
-      struct file *mapfile;
-      struct address_space *mapping = NULL;
-      if(rvma->vm_file) {
-        mapping = rvma->vm_file->f_mapping;
-        i_mmap_lock_write(mapping);
-      }
-
-      custom_find_vma_links(remote_task->mm, rvma->vm_start, rvma->vm_end, &prev, &rb_link, &rb_parent);
-
-      {
-        struct vm_area_struct *next;
-        rvma->vm_prev =  prev;
-        if(prev) {
-          next = prev->vm_next;
-          prev->vm_next = rvma;
-        } else {
-          next = remote_task->mm->mmap;
-          remote_task->mm->mmap = rvma;
-        }
-        rvma->vm_next = next;
-        if(next) next->vm_prev = rvma;
-      } //__vma_link_list(remote_task->mm, rvma, prev);
-
-      vmalrb(remote_task->mm, rvma, rb_link, rb_parent);
-
-      mapfile = rvma->vm_file;
-      if(mapfile) {
-        struct address_space *filemapping =  mapfile->f_mapping;
-        if(rvma->vm_flags & VM_DENYWRITE)
-          put_write_access(file_inode(mapfile));
-        if(rvma->vm_flags & VM_SHARED)
-          mapping_allow_writable(filemapping);
-        flush_dcache_mmap_lock(filemapping);
-        viti(rvma, &filemapping->i_mmap);
-        flush_dcache_mmap_unlock(filemapping);
-      } //__vma_link_file
-
-      if(mapping) i_mmap_unlock_write(mapping);
-      remote_task->mm->map_count++;
-      //validate_mm(remote_task->mm); //we do not validate for now
-    } //vma_link
+    custom_vma_link(rvma);
     vmstata(remote_task->mm, rvma->vm_flags, vma_pages(rvma));
-    //should more be done? should some be done elsewhere?
 
     if(!(rvma->vm_flags & VM_WIPEONFORK)) {
       unsigned long copyfrom = maximum(localstart,lvma->vm_start);
       unsigned long fromuntil = minimum(localend, lvma->vm_end);
       unsigned long copyto = maximum(remotestart, rvma->vm_start);
       unsigned long tountil = minimum(remoteend, rvma->vm_end);
-      printk(KERN_INFO "LINDLKM: %lx-%lx -> %lx-%lx\n", copyto, tountil, copyfrom, fromuntil);
-      retval = custom_copy_page_range(rvma, lvma, copyto, tountil, copyfrom, fromuntil);
+      retval = custom_copy_page_range(rvma, lvma, copyto, copyfrom, tountil, fromuntil);
     }
     if(rvma->vm_ops && rvma->vm_ops->open)
       rvma->vm_ops->open(rvma);
-    if(retval) goto undoall;
+    if(retval) goto undoall_norvma;
     copied_count += local_iov_kern[i].iov_len;
     ftmr(local_task->mm, lvma->vm_start, lvma->vm_end, PAGE_SHIFT, false);
 
@@ -698,14 +700,15 @@ anothervma:
   kfree(remote_iov_kern);
   if(copied_count == 0) return -EINVAL;
   return copied_count;
-mpolout:
-  cmpol_put(vma_policy(rvma));
-  out:
-  if(rvma) vmaf(rvma);
+out:
   kfree(local_iov_kern);
   kfree(remote_iov_kern);
   return retval;
+mpolout:
+  cmpol_put(vma_policy(rvma));
 undoall:
+  vmaf(rvma);
+undoall_norvma:
   kfree(local_iov_kern);
   printk(KERN_INFO "LINDLKM: error %d in page allocation, bailing out\n", retval);
   for(i = 0; i < liovcnt; i++) {
@@ -714,12 +717,10 @@ undoall:
     //failure happens transparently
   }
   kfree(remote_iov_kern);
-  if(!retval) return -ENOMEM;
   return retval;
 }
 
 ssize_t intercept_process_vm_writev(const struct pt_regs *regs) {
-  printk(KERN_INFO "LINDLKM: vm writev at %p intercepted with args %d %p %ld %p %ld %ld", old_vm_writev, (int) regs->di, (void*) regs->si, regs->dx, (void*) regs->r10, regs->r8, regs->r9);
   if(regs->r9 & 0x20) {
     printk(KERN_INFO "LINDLKM: intercepted and skipping vm writev");
     return process_vm_cowv(regs);
@@ -755,12 +756,10 @@ static int __init cowcall_init(void) {
   lookup_lookup_name();
   printk(KERN_INFO "LINDLKM: cowcall LKM initializing\n");
   syscall_table = (unsigned long*) kln("sys_call_table");
-  printk(KERN_INFO "LINDLKM: Syscall table at %p\n", syscall_table);
   enable_syscall_write();
   old_vm_writev = (ssize_t (*)(const struct pt_regs *)) syscall_table[__NR_process_vm_writev];
   syscall_table[__NR_process_vm_writev] = (unsigned long) intercept_process_vm_writev;
   disable_syscall_write();
-  printk(KERN_INFO "LINDLKM: Old vm writev at %p\n", old_vm_writev);
   rvhp = (typeof(&reset_vma_resv_huge_pages)) kln("reset_vma_resv_huge_pages");
   avf = (typeof(&anon_vma_fork)) kln("anon_vma_fork");
   vitia = (typeof(&vma_interval_tree_insert_after)) kln("vma_interval_tree_insert_after");
@@ -792,6 +791,7 @@ static int __init cowcall_init(void) {
   mcgc = (typeof(&mem_cgroup_charge)) kln("mem_cgroup_charge");
   dmm = (typeof(&do_munmap)) kln("do_munmap");
   mmll = *(spinlock_t*) kln("mmlist_lock");
+  printk(KERN_INFO "LINDLKM: cowcall LKM initialized\n");
   return 0;
 }
 
@@ -800,6 +800,7 @@ static void __exit cowcall_exit(void){
   enable_syscall_write();
   syscall_table[__NR_process_vm_writev] = (unsigned long) old_vm_writev;
   disable_syscall_write();
+  printk(KERN_INFO "LINDLKM: cowcall LKM unloaded\n");
 }
 
 module_init(cowcall_init);
