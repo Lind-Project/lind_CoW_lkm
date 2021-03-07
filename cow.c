@@ -31,6 +31,16 @@ MODULE_VERSION("0.1");
 #undef pte_alloc
 #define pte_alloc(mm, pmd) (unlikely(pmd_none(*(pmd))) && ptea(mm, pmd))
 #define cmpol_put(p) if(p) mpp(p)
+#define do_or_clear_bad(ptype) \
+static inline int ptype ## _none_or_clear_bad_cow(ptype ## _t *ptype) { \
+  if(ptype ## _none(*ptype)) \
+    return 1; \
+  if(unlikely(ptype ## _bad(*ptype))) { \
+    ptype ## cb(ptype); \
+    return 1; \
+  } \
+  return 0; \
+}
 
 //for syscall table juggling
 void* klnaddr;
@@ -49,6 +59,10 @@ typeof(&__p4d_alloc) p4da;
 typeof(&__pud_alloc) puda;
 typeof(&__pmd_alloc) pmda;
 typeof(&__pte_alloc) ptea;
+typeof(&pgd_clear_bad) pgdcb;
+typeof(&p4d_clear_bad) p4dcb;
+typeof(&pud_clear_bad) pudcb;
+typeof(&pmd_clear_bad) pmdcb;
 typeof(&mm_trace_rss_stat) mtrs;
 typeof(&page_add_new_anon_rmap) panar;
 typeof(&vm_normal_page) vnp;
@@ -71,6 +85,11 @@ typeof(&mem_cgroup_charge) mcgc;
 typeof(&do_munmap) dmm;
 spinlock_t mmll;
 
+do_or_clear_bad(pgd)
+do_or_clear_bad(p4d)
+do_or_clear_bad(pud)
+do_or_clear_bad(pmd)
+
 //Get address of kallsyms_lookup_name, from https://github.com/zizzu0/LinuxKernelModules
 static int __kprobes pre0(struct kprobe *p, struct pt_regs *regs) {
   klnaddr = (void*) --regs->ip;
@@ -84,7 +103,6 @@ static void do_register_kprobe(struct kprobe *kp, char *symbol_name, void* handl
   kp->pre_handler = handler;
   register_kprobe(kp);
 }
-
 static void lookup_lookup_name(void) {
   struct kprobe kp0, kp1;
   do_register_kprobe(&kp0, "kallsyms_lookup_name", pre0);
@@ -104,8 +122,10 @@ static inline void custom_mmu_notifier_invalidate_range_start(struct mmu_notifie
   lock_map_release(&__mmu_notifier_invalidate_range_start_map);
 }
 static inline void custom_mmu_notifier_invalidate_range_end(struct mmu_notifier_range* range) {
-  if(mmu_notifier_range_blockable(range)) might_sleep();
-  if(mm_has_notifiers(range->mm)) mnire(range, false);
+  if(mmu_notifier_range_blockable(range))
+    might_sleep();
+  if(mm_has_notifiers(range->mm))
+    mnire(range, false);
 }
 
 static int custom_find_vma_links(struct mm_struct *mm, unsigned long addr, unsigned long end, struct vm_area_struct **pprev, struct rb_node ***rb_link, struct rb_node **rb_parent) {
@@ -158,7 +178,8 @@ static void custom_vma_link(struct vm_area_struct* rvma) {
       memm->mmap = rvma;
     }
     rvma->vm_next = next;
-    if(next) next->vm_prev = rvma;
+    if(next)
+      next->vm_prev = rvma;
   } //__vma_link_list(remote_task->mm, rvma, prev);
 
   vmalrb(memm, rvma, rb_link, rb_parent);
@@ -175,24 +196,27 @@ static void custom_vma_link(struct vm_area_struct* rvma) {
     flush_dcache_mmap_unlock(filemapping);
   } //__vma_link_file
 
-  if(mapping) i_mmap_unlock_write(mapping);
+  if(mapping)
+    i_mmap_unlock_write(mapping);
   memm->map_count++;
   //validate_mm(memm); //we do not validate
-} //vma_link
+}
 
 static inline int custom_munmap_vma_range(struct mm_struct *mm, unsigned long start, unsigned long len, 
-		                          struct vm_area_struct **pprev, struct rb_node ***link, 
-					  struct rb_node **parent, struct list_head *uf) {
+                              struct vm_area_struct **pprev, struct rb_node ***link, 
+            struct rb_node **parent, struct list_head *uf) {
   while(custom_find_vma_links(mm, start, start + len, pprev, link, parent)) {
     int unmapval = dmm(mm, start, len, uf);
-    if(unmapval) return unmapval;
+    if(unmapval)
+      return unmapval;
   }
   return 0;
 }
 
 static inline struct page* custom_page_copy_prealloc(struct mm_struct *src_mm, struct vm_area_struct *vma, unsigned long addr) {
   struct page *new_page = alloc_page_vma(GFP_HIGHUSER_MOVABLE, vma, addr);
-  if(!new_page) return NULL;
+  if(!new_page)
+    return NULL;
   if(mcgc(new_page, src_mm, GFP_KERNEL)) {
     put_page(new_page);
     return NULL;
@@ -202,8 +226,8 @@ static inline struct page* custom_page_copy_prealloc(struct mm_struct *src_mm, s
 }
 
 static int custom_copy_present_pte(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma, 
-		                   pte_t *dst_pte, pte_t *src_pte, unsigned long dstaddr, unsigned long srcaddr, 
-				   int *rss, struct page **prealloc) {
+                       pte_t *dst_pte, pte_t *src_pte, unsigned long dstaddr, unsigned long srcaddr, 
+           int *rss, struct page **prealloc) {
   struct mm_struct *src_mm = src_vma->vm_mm;
   unsigned long vm_flags = src_vma->vm_flags;
   pte_t pte = *src_pte;
@@ -211,16 +235,20 @@ static int custom_copy_present_pte(struct vm_area_struct *dst_vma, struct vm_are
 
   page = vnp(src_vma, srcaddr, pte);
   if(page) {
-    //copy_present_page
     struct page *new_page;
-    if(!((vm_flags & (VM_SHARED | VM_MAYWRITE)) == VM_MAYWRITE)) goto page_copied;
-    if(likely(!atomic_read(&src_mm->has_pinned))) goto page_copied;
-    if(likely(!page_maybe_dma_pinned(page))) goto page_copied;
+    //If these branches are taken, the page need not be allocated
+    if(!((vm_flags & (VM_SHARED | VM_MAYWRITE)) == VM_MAYWRITE))
+      goto page_copied;
+    if(likely(!atomic_read(&src_mm->has_pinned)))
+      goto page_copied;
+    if(likely(!page_maybe_dma_pinned(page)))
+      goto page_copied;
 
     //otherwise manually assign+copy preallocated page at pte
     //if none exists, return with -EAGAIN so that calling code can allocate one
     new_page = *prealloc;
-    if(!new_page) return -EAGAIN;
+    if(!new_page)
+      return -EAGAIN;
     *prealloc = NULL;
     copy_user_highpage(new_page, page, dstaddr, src_vma);
     __SetPageUptodate(new_page);
@@ -244,27 +272,31 @@ page_copied:
     pte = pte_wrprotect(pte);
   }
 
-  if(vm_flags & VM_SHARED) pte = pte_mkclean(pte);
+  if(vm_flags & VM_SHARED)
+    pte = pte_mkclean(pte);
   pte = pte_mkold(pte);
 
-  if(!(vm_flags = VM_UFFD_WP)) pte = pte_clear_uffd_wp(pte);
+  if(!(vm_flags = VM_UFFD_WP))
+    pte = pte_clear_uffd_wp(pte);
   set_pte_at(dst_vma->vm_mm, dstaddr, dst_pte, pte);
   return 0;
 }
 
 static unsigned long custom_copy_nonpresent_pte(struct mm_struct *dst_mm, struct mm_struct* src_mm, 
-		                                pte_t *dst_pte, pte_t *src_pte, struct vm_area_struct *vma, 
-						unsigned long dstaddr, unsigned long srcaddr, int* rss) {
+                                    pte_t *dst_pte, pte_t *src_pte, struct vm_area_struct *vma, 
+            unsigned long dstaddr, unsigned long srcaddr, int* rss) {
   unsigned long vm_flags = vma->vm_flags;
   pte_t pte = *src_pte;
   struct page *page;
   swp_entry_t entry = pte_to_swp_entry(pte);
 
   if(likely(!non_swap_entry(entry))) {
-    if(swdup(entry) < 0) return entry.val;
+    if(swdup(entry) < 0)
+      return entry.val;
     if(unlikely(list_empty(&dst_mm->mmlist))) {
       spin_lock(&mmll);
-      if(list_empty(&dst_mm->mmlist)) list_add(&dst_mm->mmlist, &src_mm->mmlist);
+      if(list_empty(&dst_mm->mmlist))
+        list_add(&dst_mm->mmlist, &src_mm->mmlist);
       spin_unlock(&mmll);
     }
     rss[MM_SWAPENTS]++;
@@ -274,8 +306,10 @@ static unsigned long custom_copy_nonpresent_pte(struct mm_struct *dst_mm, struct
     if(is_write_migration_entry(entry) && (vm_flags & (VM_SHARED | VM_MAYWRITE)) == VM_MAYWRITE) {
       make_migration_entry_read(&entry);
       pte = swp_entry_to_pte(entry);
-      if(pte_swp_soft_dirty(*src_pte)) pte = pte_swp_mksoft_dirty(pte);
-      if(pte_swp_uffd_wp(*src_pte)) pte = pte_swp_mkuffd_wp(pte);
+      if(pte_swp_soft_dirty(*src_pte))
+        pte = pte_swp_mksoft_dirty(pte);
+      if(pte_swp_uffd_wp(*src_pte))
+        pte = pte_swp_mkuffd_wp(pte);
       set_pte_at(src_mm, srcaddr, src_pte, pte);
     }
   } else if(is_device_private_entry(entry)) {
@@ -286,7 +320,8 @@ static unsigned long custom_copy_nonpresent_pte(struct mm_struct *dst_mm, struct
     if(is_write_device_private_entry(entry) && (vm_flags & (VM_SHARED | VM_MAYWRITE)) == VM_MAYWRITE) {
       make_device_private_entry_read(&entry);
       pte = swp_entry_to_pte(entry);
-      if(pte_swp_uffd_wp(*src_pte)) pte = pte_swp_mkuffd_wp(pte);
+      if(pte_swp_uffd_wp(*src_pte))
+        pte = pte_swp_mkuffd_wp(pte);
       set_pte_at(src_mm, srcaddr, src_pte, pte);
     }
   }
@@ -295,9 +330,9 @@ static unsigned long custom_copy_nonpresent_pte(struct mm_struct *dst_mm, struct
 }
 
 static int general_copy_pte_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
-		                  pmd_t *dst_pmd, pmd_t *src_pmd,
-		                  unsigned long dstaddr, unsigned long srcaddr,
-		                  unsigned long dstend, unsigned long srcend) {
+                      pmd_t *dst_pmd, pmd_t *src_pmd,
+                      unsigned long dstaddr, unsigned long srcaddr,
+                      unsigned long dstend, unsigned long srcend) {
   pte_t *orig_src_pte, *orig_dst_pte;
   pte_t *src_pte, *dst_pte;
   spinlock_t *src_ptl, *dst_ptl;
@@ -308,7 +343,8 @@ static int general_copy_pte_range(struct vm_area_struct *dst_vma, struct vm_area
   struct mm_struct *dst_mm = dst_vma->vm_mm;
   struct mm_struct *src_mm = src_vma->vm_mm;
 again:
-  if(srcaddr >= srcend || dstaddr >= dstend) return 0;
+  if(srcaddr >= srcend || dstaddr >= dstend)
+    return 0;
   progress = 0;
   memset(rss, 0, sizeof(int) * NR_MM_COUNTERS);
 
@@ -326,7 +362,8 @@ again:
   do {
     if(progress >= 32) {
       progress = 0;
-      if(need_resched() || spin_needbreak(src_ptl) || spin_needbreak(dst_ptl)) break;
+      if(need_resched() || spin_needbreak(src_ptl) || spin_needbreak(dst_ptl))
+        break;
     }
     if(pte_none(*src_pte)) {
       progress++;
@@ -334,12 +371,14 @@ again:
     }
     if(unlikely(!pte_present(*src_pte))) {
       entry.val = custom_copy_nonpresent_pte(dst_mm, src_mm, dst_pte, src_pte, src_vma, dstaddr, srcaddr, rss);
-      if(entry.val) break;
+      if(entry.val)
+        break;
       progress += 8;
       continue;
     }
     ret = custom_copy_present_pte(dst_vma, src_vma, dst_pte, src_pte, dstaddr, srcaddr, rss, &prealloc);
-    if(unlikely(ret == -EAGAIN)) break;
+    if(unlikely(ret == -EAGAIN))
+      break;
     if(unlikely(prealloc)) {
       put_page(prealloc);
       prealloc = NULL;
@@ -380,12 +419,15 @@ again:
   } else if(ret) {
     WARN_ON_ONCE(ret != -EAGAIN);
     prealloc = custom_page_copy_prealloc(src_mm, src_vma, srcaddr);
-    if(!prealloc) return -ENOMEM;
+    if(!prealloc)
+      return -ENOMEM;
     ret = 0;
   }
-  if(srcaddr != srcend) goto again;
+  if(srcaddr != srcend)
+    goto again;
 out:
-  if(unlikely(prealloc)) put_page(prealloc);
+  if(unlikely(prealloc))
+    put_page(prealloc);
   return ret;
 }
 
@@ -398,14 +440,15 @@ static int general_copy_pmd_range(struct vm_area_struct *dst_vma, struct vm_area
   unsigned long pmd_src_next, pmd_dst_next;
   int ret;
   dst_pmd = pmdalloc(dst_mm, dst_pud, dstaddr);
-  if(!dst_pmd) return -ENOMEM;
+  if(!dst_pmd)
+    return -ENOMEM;
   src_pmd = pmd_offset(src_pud, srcaddr);
   while(srcaddr != srcend && dstaddr != dstend) {
     pmd_src_next = pmd_addr_end(srcaddr, srcend);
     pmd_dst_next = pmd_addr_end(dstaddr, dstend);
     if(is_swap_pmd(*src_pmd) || pmd_trans_huge(*src_pmd) || pmd_devmap(*src_pmd))
       return -EINVAL;
-    if(!(pmd_none(*src_pmd) || pmd_bad(*src_pmd)))
+    if(!pmd_none_or_clear_bad_cow(src_pmd))
       if((ret = general_copy_pte_range(dst_vma, src_vma, dst_pmd, src_pmd, dstaddr, srcaddr, pmd_dst_next, pmd_src_next)))
         return ret;
     if(pmd_src_next - srcaddr > pmd_dst_next - dstaddr) {
@@ -433,14 +476,15 @@ static int general_copy_pud_range(struct vm_area_struct *dst_vma, struct vm_area
   int ret;
   unsigned long pud_src_next, pud_dst_next;
   dst_pud = pudalloc(dst_mm, dst_p4d, dstaddr);
-  if(!dst_pud) return -ENOMEM;
+  if(!dst_pud)
+    return -ENOMEM;
   src_pud = pud_offset(src_p4d, srcaddr);
   while(srcaddr != srcend && dstaddr != dstend) {
     pud_src_next = pud_addr_end(srcaddr, srcend);
     pud_dst_next = pud_addr_end(dstaddr, dstend);
     if(pud_trans_huge(*src_pud) || pud_devmap(*src_pud)) 
       return -EINVAL;
-    if(!(pud_none(*src_pud) || pud_bad(*src_pud)))
+    if(!pud_none_or_clear_bad_cow(src_pud))
       if((ret = general_copy_pmd_range(dst_vma, src_vma, dst_pud, src_pud, dstaddr, srcaddr, pud_dst_next, pud_src_next)))
         return ret;
     if(pud_src_next - srcaddr > pud_dst_next - dstaddr) {
@@ -467,12 +511,13 @@ static int general_copy_p4d_range(struct vm_area_struct *dst_vma, struct vm_area
   int ret;
   unsigned long p4d_src_next, p4d_dst_next;
   dst_p4d = p4dalloc(dst_mm, dst_pgd, dstaddr);
-  if(!dst_p4d) return -ENOMEM;
+  if(!dst_p4d)
+    return -ENOMEM;
   src_p4d = p4d_offset(src_pgd, srcaddr);
   while(srcaddr != srcend && dstaddr != dstend) {
     p4d_src_next = p4d_addr_end(srcaddr, srcend);
     p4d_dst_next = p4d_addr_end(dstaddr, dstend);
-    if(!(p4d_none(*src_p4d) || p4d_bad(*src_p4d)))
+    if(!p4d_none_or_clear_bad_cow(src_p4d))
       if((ret = general_copy_pud_range(dst_vma, src_vma, dst_p4d, src_p4d, dstaddr, srcaddr, p4d_dst_next, p4d_src_next)))
         return ret;
     if(p4d_src_next - srcaddr > p4d_dst_next - dstaddr) {
@@ -502,7 +547,7 @@ static int general_copy_pgd_range(struct vm_area_struct *dst_vma, struct vm_area
   while(srcaddr != srcend && dstaddr != dstend) {
     srcnext = pgd_addr_end(srcaddr, srcend);
     dstnext = pgd_addr_end(dstaddr, dstend);
-    if(!(pgd_none(*src_pgd) || pgd_bad(*src_pgd)))  //probably we should clear bad?
+    if(!pgd_none_or_clear_bad_cow(src_pgd))
       if((ret = general_copy_p4d_range(dst_vma, src_vma, dst_pgd, src_pgd, dstaddr, srcaddr, dstnext, srcnext)))
         return ret;
     if(srcnext - srcaddr > dstnext - dstaddr) {
@@ -521,21 +566,23 @@ static int general_copy_pgd_range(struct vm_area_struct *dst_vma, struct vm_area
 }
 
 int custom_copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
-		           unsigned long dstaddr, unsigned long srcaddr,
-			   unsigned long dstend, unsigned long srcend) {
+                           unsigned long dstaddr, unsigned long srcaddr,
+                           unsigned long dstend, unsigned long srcend) {
   struct mm_struct *dst_mm = dst_vma->vm_mm;
   struct mm_struct *src_mm = src_vma->vm_mm;
   struct mmu_notifier_range range;
   bool is_cow;
   int ret;
-  if(src_mm != dst_mm) return -ENOTSUPP;
+  if(src_mm != dst_mm)
+    return -ENOTSUPP;
   if(!(src_vma->vm_flags & (VM_HUGETLB | VM_PFNMAP | VM_MIXEDMAP)) && !src_vma->anon_vma)
     return 0;
   if(is_vm_hugetlb_page(src_vma))
     return -EINVAL;
   if(unlikely(src_vma->vm_flags & VM_PFNMAP)) {
     ret = tpc(src_vma);
-    if(ret) return ret;
+    if(ret)
+      return ret;
   }
 
   mmap_write_lock(dst_mm);
@@ -590,6 +637,7 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
     goto out;
   }
   
+  //validate input vectors
   remote_task = pid_task(find_vpid(pid), PIDTYPE_PID);
   for(i = 0; i < liovcnt; i++) {
     if(local_iov_kern[i].iov_len != remote_iov_kern[i].iov_len) {
@@ -597,7 +645,14 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
       printk(KERN_INFO "LINDLKM: error in iovecs input, corresponding elements are different lengths\n");
       goto out;
     }
+    if((unsigned long) remote_iov_kern[i].iov_base & (PAGE_SIZE-1) || remote_iov_kern[i].iov_len & (PAGE_SIZE-1)) {
+      retval = -EINVAL;
+      printk(KERN_INFO "LINDLKM: error in iovecs input, address not page aligned or length not a multiple of page length\n");
+      goto out;
+    }
   }
+
+  //perform copy, finding vmas in the range and copying them accordingly
   for(i = 0; i < liovcnt; i++) {
     struct file *file;
     unsigned long localstart = (unsigned long)local_iov_kern[i].iov_base;
@@ -607,16 +662,15 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
 
     if((retval = custom_munmap_vma_range(remote_task->mm, (unsigned long) remotestart, remote_iov_kern[i].iov_len, &prev, &rb_link, &rb_parent, &uf))) {
       retval = -EINVAL;
-      goto out;
+      goto undoall_norvma;
     }
 
     rvma = NULL;
 anothervma:
     lvma = find_vma_intersection(local_task->mm, localstart, localend);
 
-    if(lvma->vm_flags & VM_DONTCOPY) {
+    if(lvma->vm_flags & VM_DONTCOPY)
       continue;
-    }
 
     if(fatal_signal_pending(current)) {
       retval = -EINTR;
@@ -688,34 +742,34 @@ anothervma:
     }
     if(rvma->vm_ops && rvma->vm_ops->open)
       rvma->vm_ops->open(rvma);
-    if(retval) goto undoall_norvma;
+    if(retval)
+      goto undoall_norvma;
     copied_count += local_iov_kern[i].iov_len;
     ftmr(local_task->mm, lvma->vm_start, lvma->vm_end, PAGE_SHIFT, false);
 
     localstart = lvma->vm_end;
-    if(localstart < localend) goto anothervma;
+    if(localstart < localend)
+      goto anothervma;
   }
   dufdc(&uf);
   kfree(local_iov_kern);
   kfree(remote_iov_kern);
-  if(copied_count == 0) return -EINVAL;
+  if(copied_count == 0)
+    return -EINVAL;
   return copied_count;
-out:
-  kfree(local_iov_kern);
-  kfree(remote_iov_kern);
-  return retval;
 mpolout:
   cmpol_put(vma_policy(rvma));
 undoall:
   vmaf(rvma);
 undoall_norvma:
-  kfree(local_iov_kern);
   printk(KERN_INFO "LINDLKM: error %d in page allocation, bailing out\n", retval);
   for(i = 0; i < liovcnt; i++) {
     custom_munmap_vma_range(remote_task->mm, (unsigned long) remote_iov_kern[i].iov_base, 
-		            remote_iov_kern[i].iov_len, &prev, &rb_link, &rb_parent, &uf);
+                            remote_iov_kern[i].iov_len, &prev, &rb_link, &rb_parent, &uf);
     //failure happens transparently
   }
+out:
+  kfree(local_iov_kern);
   kfree(remote_iov_kern);
   return retval;
 }
@@ -769,6 +823,10 @@ static int __init cowcall_init(void) {
   puda = (typeof(&__pud_alloc)) kln("__pud_alloc");
   pmda = (typeof(&__pmd_alloc)) kln("__pmd_alloc");
   ptea = (typeof(&__pte_alloc)) kln("__pte_alloc");
+  pgdcb = (typeof(&pgd_clear_bad)) kln("pgd_clear_bad");
+  p4dcb = (typeof(&p4d_clear_bad)) kln("p4d_clear_bad");
+  pudcb = (typeof(&pud_clear_bad)) kln("pud_clear_bad");
+  pmdcb = (typeof(&pmd_clear_bad)) kln("pmd_clear_bad");
   mtrs = (typeof(&mm_trace_rss_stat)) kln("mm_trace_rss_stat");
   panar = (typeof(&page_add_new_anon_rmap)) kln("page_add_new_anon_rmap");
   vnp = (typeof(&vm_normal_page)) kln("vm_normal_page");
