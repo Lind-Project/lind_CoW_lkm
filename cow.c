@@ -156,14 +156,14 @@ static int custom_find_vma_links(struct mm_struct *mm, unsigned long addr, unsig
 
 
 static void custom_vma_link(struct vm_area_struct* rvma) {
-  struct file *mapfile;
+  struct file *mapfile = rvma->vm_file;
   struct address_space *mapping = NULL;
   struct mm_struct* memm = rvma->vm_mm;
   struct vm_area_struct *prev;
   struct rb_node **rb_link, *rb_parent;
 
-  if(rvma->vm_file) {
-    mapping = rvma->vm_file->f_mapping;
+  if(mapfile) {
+    mapping = mapfile->f_mapping;
     i_mmap_lock_write(mapping);
   }
   custom_find_vma_links(memm, rvma->vm_start, rvma->vm_end, &prev, &rb_link, &rb_parent);
@@ -184,20 +184,17 @@ static void custom_vma_link(struct vm_area_struct* rvma) {
 
   vmalrb(memm, rvma, rb_link, rb_parent);
 
-  mapfile = rvma->vm_file;
   if(mapfile) {
-    struct address_space *filemapping = mapfile->f_mapping;
     if(rvma->vm_flags & VM_DENYWRITE)
       put_write_access(file_inode(mapfile));
     if(rvma->vm_flags & VM_SHARED)
-      mapping_allow_writable(filemapping);
-    flush_dcache_mmap_lock(filemapping);
-    viti(rvma, &filemapping->i_mmap);
-    flush_dcache_mmap_unlock(filemapping);
+      mapping_allow_writable(mapping);
+    flush_dcache_mmap_lock(mapping);
+    viti(rvma, &mapping->i_mmap);
+    flush_dcache_mmap_unlock(mapping);
+    i_mmap_unlock_write(mapping);
   } //__vma_link_file
 
-  if(mapping)
-    i_mmap_unlock_write(mapping);
   memm->map_count++;
   //validate_mm(memm); //we do not validate
 }
@@ -645,29 +642,47 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
       printk(KERN_INFO "LINDLKM: error in iovecs input, corresponding elements are different lengths\n");
       goto out;
     }
+    if(!local_iov_kern[i].iov_base || !remote_iov_kern[i].iov_base) {
+      retval = -EINVAL;
+      printk(KERN_INFO "LINDLKM: error in iovecs input, input has a null address\n");
+      goto out;
+    }
     if((unsigned long) remote_iov_kern[i].iov_base & (PAGE_SIZE-1) || remote_iov_kern[i].iov_len & (PAGE_SIZE-1)) {
       retval = -EINVAL;
       printk(KERN_INFO "LINDLKM: error in iovecs input, address not page aligned or length not a multiple of page length\n");
+      goto out;
+    }
+    if((unsigned long) remote_iov_kern[i].iov_base <= (unsigned long) local_iov_kern[i].iov_base) {
+      if((unsigned long) remote_iov_kern[i].iov_base + remote_iov_kern[i].iov_len > (unsigned long) local_iov_kern[i].iov_base) {
+      retval = -EINVAL;
+      printk(KERN_INFO "LINDLKM: error in iovecs input, corresponding mappings overlap\n");
+      goto out;
+      }
+    } else if((unsigned long) local_iov_kern[i].iov_base + local_iov_kern[i].iov_len > (unsigned long) remote_iov_kern[i].iov_base) {
+      retval = -EINVAL;
+      printk(KERN_INFO "LINDLKM: error in iovecs input, corresponding mappings overlap\n");
       goto out;
     }
   }
 
   //perform copy, finding vmas in the range and copying them accordingly
   for(i = 0; i < liovcnt; i++) {
-    struct file *file;
     unsigned long localstart = (unsigned long)local_iov_kern[i].iov_base;
     unsigned long localend = localstart + local_iov_kern[i].iov_len;
     unsigned long remotestart = (unsigned long)remote_iov_kern[i].iov_base;
     unsigned long remoteend = remotestart + remote_iov_kern[i].iov_len;
+    if(localstart == localend) continue;
 
-    if((retval = custom_munmap_vma_range(remote_task->mm, (unsigned long) remotestart, remote_iov_kern[i].iov_len, &prev, &rb_link, &rb_parent, &uf))) {
-      retval = -EINVAL;
+    if((retval = custom_munmap_vma_range(remote_task->mm, (unsigned long) remotestart, remote_iov_kern[i].iov_len, &prev, &rb_link, &rb_parent, &uf)))
       goto undoall_norvma;
-    }
 
     rvma = NULL;
 anothervma:
     lvma = find_vma_intersection(local_task->mm, localstart, localend);
+    if(!lvma) {
+      printk(KERN_INFO "LINDLKM: no lvma found %lx %lx\n", localstart, localend);
+      continue;
+    }
 
     if(lvma->vm_flags & VM_DONTCOPY)
       continue;
@@ -712,21 +727,6 @@ anothervma:
       goto mpolout;
     }
     rvma->vm_flags &= ~(VM_LOCKED | VM_LOCKONFAULT);
-    file = rvma->vm_file;
-    if(file) {
-      struct inode *inode = file_inode(file);
-      struct address_space *mapping = file->f_mapping;
-      get_file(file);
-      if(rvma->vm_flags & VM_DENYWRITE)
-        atomic_dec(&inode->i_writecount);
-      i_mmap_lock_write(mapping);
-      if(rvma->vm_flags & VM_SHARED)
-        atomic_dec(&mapping->i_mmap_writable);
-      flush_dcache_mmap_lock(mapping);
-      vitia(rvma, lvma, &mapping->i_mmap);
-      flush_dcache_mmap_unlock(mapping);
-      i_mmap_unlock_write(mapping);
-    }
     if(is_vm_hugetlb_page(rvma))
       goto mpolout; //hugetlb pages are not supported!
 
