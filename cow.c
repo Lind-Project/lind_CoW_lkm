@@ -656,10 +656,10 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
       printk(KERN_INFO "LINDLKM: error in iovecs input, address not page aligned or length not a multiple of page length\n");
       goto out;
     }
-    if((unsigned long) remote_iov_kern[i].iov_base >= (~PAGE_OFFSET) || 
-       (unsigned long) (remote_iov_kern[i].iov_base + remote_iov_kern[i].iov_len) >= (~PAGE_OFFSET) || 
-       (unsigned long) local_iov_kern[i].iov_base >= (~PAGE_OFFSET) || 
-       (unsigned long) (local_iov_kern[i].iov_base + local_iov_kern[i].iov_len) >= (~PAGE_OFFSET)) {
+    if((unsigned long) remote_iov_kern[i].iov_base >= TASK_SIZE_MAX || 
+       (unsigned long) (remote_iov_kern[i].iov_base + remote_iov_kern[i].iov_len) >= TASK_SIZE_MAX || 
+       (unsigned long) local_iov_kern[i].iov_base >= TASK_SIZE_MAX || 
+       (unsigned long) (local_iov_kern[i].iov_base + local_iov_kern[i].iov_len) >= TASK_SIZE_MAX) {
       retval = -EINVAL;
       printk(KERN_INFO "LINDLKM: error in iovecs input, address not canonical or in kernel address space\n");
       goto out;
