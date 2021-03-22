@@ -155,7 +155,7 @@ static int custom_find_vma_links(struct mm_struct *mm, unsigned long addr, unsig
 }
 
 
-static void custom_vma_link(struct vm_area_struct* rvma) {
+static void custom_vma_link(struct vm_area_struct* rvma, struct vm_area_struct* lvma) {
   struct file *mapfile = rvma->vm_file;
   struct address_space *mapping = NULL;
   struct mm_struct* memm = rvma->vm_mm;
@@ -166,6 +166,19 @@ static void custom_vma_link(struct vm_area_struct* rvma) {
     mapping = mapfile->f_mapping;
     i_mmap_lock_write(mapping);
   }
+
+  if(mapfile) {
+    get_file(mapfile);
+    if(rvma->vm_flags & VM_DENYWRITE)
+      put_write_access(file_inode(mapfile));
+    if(rvma->vm_flags & VM_SHARED)
+      mapping_allow_writable(mapping);
+    flush_dcache_mmap_lock(mapping);
+    vitia(rvma, lvma, &mapping->i_mmap);
+    flush_dcache_mmap_unlock(mapping);
+    i_mmap_unlock_write(mapping);
+  } //__vma_link_file
+
   custom_find_vma_links(memm, rvma->vm_start, rvma->vm_end, &prev, &rb_link, &rb_parent);
   {
     struct vm_area_struct *next;
@@ -183,17 +196,6 @@ static void custom_vma_link(struct vm_area_struct* rvma) {
   } //__vma_link_list(remote_task->mm, rvma, prev);
 
   vmalrb(memm, rvma, rb_link, rb_parent);
-
-  if(mapfile) {
-    if(rvma->vm_flags & VM_DENYWRITE)
-      put_write_access(file_inode(mapfile));
-    if(rvma->vm_flags & VM_SHARED)
-      mapping_allow_writable(mapping);
-    flush_dcache_mmap_lock(mapping);
-    viti(rvma, &mapping->i_mmap);
-    flush_dcache_mmap_unlock(mapping);
-    i_mmap_unlock_write(mapping);
-  } //__vma_link_file
 
   memm->map_count++;
   //validate_mm(memm); //we do not validate
@@ -280,12 +282,13 @@ page_copied:
 }
 
 static unsigned long custom_copy_nonpresent_pte(struct mm_struct *dst_mm, struct mm_struct* src_mm, 
-                                    pte_t *dst_pte, pte_t *src_pte, struct vm_area_struct *vma, 
-            unsigned long dstaddr, unsigned long srcaddr, int* rss) {
+                                                pte_t *dst_pte, pte_t *src_pte, struct vm_area_struct *vma, 
+                                                unsigned long dstaddr, unsigned long srcaddr, int* rss) {
   unsigned long vm_flags = vma->vm_flags;
   pte_t pte = *src_pte;
   struct page *page;
   swp_entry_t entry = pte_to_swp_entry(pte);
+	printk(KERN_INFO "LINDLKM: copying nonpresent pte???\n");
 
   if(likely(!non_swap_entry(entry))) {
     if(swdup(entry) < 0)
@@ -582,7 +585,7 @@ int custom_copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct
       return ret;
   }
 
-  mmap_write_lock(dst_mm);
+  //mmap_write_lock(dst_mm);
   is_cow = (src_vma->vm_flags & (VM_SHARED | VM_MAYWRITE)) == VM_MAYWRITE;
   if(is_cow) {
     mmu_notifier_range_init(&range, MMU_NOTIFY_PROTECTION_PAGE, 0, src_vma, src_mm, srcaddr, srcend);
@@ -598,7 +601,7 @@ int custom_copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct
     raw_write_seqcount_end(&src_mm->write_protect_seq);
     custom_mmu_notifier_invalidate_range_end(&range);
   }
-  mmap_write_unlock(dst_mm);
+  //mmap_write_unlock(dst_mm);
   return ret;
 }
 
@@ -647,9 +650,18 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
       printk(KERN_INFO "LINDLKM: error in iovecs input, input has a null address\n");
       goto out;
     }
-    if((unsigned long) remote_iov_kern[i].iov_base & (PAGE_SIZE-1) || remote_iov_kern[i].iov_len & (PAGE_SIZE-1)) {
+    if((unsigned long) remote_iov_kern[i].iov_base & (PAGE_SIZE-1) || remote_iov_kern[i].iov_len & (PAGE_SIZE-1) || 
+       (unsigned long) local_iov_kern[i].iov_base & (PAGE_SIZE-1) || local_iov_kern[i].iov_len & (PAGE_SIZE-1)) {
       retval = -EINVAL;
       printk(KERN_INFO "LINDLKM: error in iovecs input, address not page aligned or length not a multiple of page length\n");
+      goto out;
+    }
+    if((unsigned long) remote_iov_kern[i].iov_base >= (~PAGE_OFFSET) || 
+       (unsigned long) (remote_iov_kern[i].iov_base + remote_iov_kern[i].iov_len) >= (~PAGE_OFFSET) || 
+       (unsigned long) local_iov_kern[i].iov_base >= (~PAGE_OFFSET) || 
+       (unsigned long) (local_iov_kern[i].iov_base + local_iov_kern[i].iov_len) >= (~PAGE_OFFSET)) {
+      retval = -EINVAL;
+      printk(KERN_INFO "LINDLKM: error in iovecs input, address not canonical or in kernel address space\n");
       goto out;
     }
     if((unsigned long) remote_iov_kern[i].iov_base <= (unsigned long) local_iov_kern[i].iov_base) {
@@ -665,6 +677,7 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
     }
   }
 
+  mmap_write_lock(remote_task->mm);
   //perform copy, finding vmas in the range and copying them accordingly
   for(i = 0; i < liovcnt; i++) {
     unsigned long localstart = (unsigned long)local_iov_kern[i].iov_base;
@@ -684,8 +697,10 @@ anothervma:
       continue;
     }
 
-    if(lvma->vm_flags & VM_DONTCOPY)
-      continue;
+    if(lvma->vm_flags & VM_DONTCOPY) {
+      localstart = lvma->vm_end;
+      goto anothervma;
+    }
 
     if(fatal_signal_pending(current)) {
       retval = -EINTR;
@@ -730,8 +745,9 @@ anothervma:
     if(is_vm_hugetlb_page(rvma))
       goto mpolout; //hugetlb pages are not supported!
 
-    custom_vma_link(rvma);
+    custom_vma_link(rvma, lvma);
     vmstata(remote_task->mm, rvma->vm_flags, vma_pages(rvma));
+
 
     if(!(rvma->vm_flags & VM_WIPEONFORK)) {
       unsigned long copyfrom = maximum(localstart,lvma->vm_start);
@@ -751,6 +767,7 @@ anothervma:
     if(localstart < localend)
       goto anothervma;
   }
+  mmap_write_unlock(remote_task->mm);
   dufdc(&uf);
   kfree(local_iov_kern);
   kfree(remote_iov_kern);
@@ -768,6 +785,7 @@ undoall_norvma:
                             remote_iov_kern[i].iov_len, &prev, &rb_link, &rb_parent, &uf);
     //failure happens transparently
   }
+  mmap_write_unlock(remote_task->mm);
 out:
   kfree(local_iov_kern);
   kfree(remote_iov_kern);
