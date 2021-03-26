@@ -165,17 +165,17 @@ static void custom_vma_link(struct vm_area_struct* rvma, struct vm_area_struct* 
   if(mapfile) {
     mapping = mapfile->f_mapping;
     i_mmap_lock_write(mapping);
-  }
 
-  if(mapfile) {
     get_file(mapfile);
     if(rvma->vm_flags & VM_DENYWRITE)
       put_write_access(file_inode(mapfile));
     if(rvma->vm_flags & VM_SHARED)
       mapping_allow_writable(mapping);
+
     flush_dcache_mmap_lock(mapping);
     vitia(rvma, lvma, &mapping->i_mmap);
     flush_dcache_mmap_unlock(mapping);
+
     i_mmap_unlock_write(mapping);
   } //__vma_link_file
 
