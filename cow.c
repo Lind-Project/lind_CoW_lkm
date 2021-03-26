@@ -328,7 +328,7 @@ static int general_copy_pte_range(struct vm_area_struct *dst_vma, struct vm_area
                       unsigned long dstend, unsigned long srcend) {
   pte_t *orig_src_pte, *orig_dst_pte;
   pte_t *src_pte, *dst_pte;
-  spinlock_t *src_ptl, *dst_ptl;
+  spinlock_t *dst_ptl;
   int progress, ret = 0;
   int rss[NR_MM_COUNTERS];
   swp_entry_t entry = (swp_entry_t){0};
@@ -347,15 +347,16 @@ again:
     goto out;
   }
   src_pte = pte_offset_map(src_pmd, srcaddr);
-  src_ptl = pte_lockptr(src_mm, src_pmd);
-  spin_lock_nested(src_ptl, SINGLE_DEPTH_NESTING);
+  //src_ptl = pte_lockptr(src_mm, src_pmd);
+  //spin_lock_nested(src_ptl, SINGLE_DEPTH_NESTING);
+  //pte_alloc_map_lock already locks for us, to do so again causes deadlock
   orig_src_pte = src_pte;
   orig_dst_pte = dst_pte;
   arch_enter_lazy_mmu_mode();
   do {
     if(progress >= 32) {
       progress = 0;
-      if(need_resched() || spin_needbreak(src_ptl) || spin_needbreak(dst_ptl))
+      if(need_resched() || /*spin_needbreak(src_ptl) ||*/ spin_needbreak(dst_ptl))
         break;
     }
     if(pte_none(*src_pte)) {
@@ -379,7 +380,7 @@ again:
     progress += 8;
   } while(dst_pte++, src_pte++, srcaddr += PAGE_SIZE, dstaddr += PAGE_SIZE, srcaddr != srcend && dstaddr != dstend);
   arch_leave_lazy_mmu_mode();
-  spin_unlock(src_ptl);
+  //spin_unlock(src_ptl);
   pte_unmap(orig_src_pte);
   {
     int i;
@@ -617,6 +618,7 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
 
   if(liovcnt != riovcnt || liovcnt > UIO_MAXIOV) {
     retval = -EINVAL;
+    printk(KERN_INFO "LINDLKM: error in iovecs input, input and output vector have different lengths\n");
     goto out;
   }
 
@@ -678,12 +680,14 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
     unsigned long remoteend = remotestart + remote_iov_kern[i].iov_len;
     if(localstart == localend) continue;
 
+    printk(KERN_INFO "LINDLKM: undoingallnorvma\n");
     if((retval = custom_munmap_vma_range(remote_task->mm, (unsigned long) remotestart, remote_iov_kern[i].iov_len, &prev, &rb_link, &rb_parent, &uf)))
       goto undoall_norvma;
 
     rvma = NULL;
 anothervma:
     lvma = find_vma_intersection(local_task->mm, localstart, localend);
+    printk(KERN_INFO "LINDLKM: finding intersection\n");
     if(!lvma) {
       printk(KERN_INFO "LINDLKM: no lvma found %lx %lx\n", localstart, localend);
       continue;
@@ -765,8 +769,6 @@ anothervma:
   dufdc(&uf);
   kfree(local_iov_kern);
   kfree(remote_iov_kern);
-  if(copied_count == 0)
-    return -EINVAL;
   return copied_count;
 mpolout:
   cmpol_put(vma_policy(rvma));

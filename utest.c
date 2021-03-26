@@ -103,9 +103,19 @@ void testknownfail() {
   struct iovec firstpagevec[1] = {{0, 0xe000}};
   assert(process_vm_writev(getpid(), firstpagevec, 1, outvec, 1, 0x20) == -1);
   assert(process_vm_writev(getpid(), invec, 1, firstpagevec, 1, 0x20) == -1);
-  assert(process_vm_writev(getpid(), (void*) 0xdeff3321000, 1, outvec, 1, 0x20) == 0xE000);
+  void* garbage = (void*) 0xdeff3321000; //garbage address
+  assert(process_vm_writev(getpid(), garbage, 1, outvec, 1, 0x20) == -1);
+  assert(process_vm_writev(getpid(), invec, 1, garbage, 1, 0x20) == -1);
+  invec[0].iov_base = garbage;
+  assert(process_vm_writev(getpid(), invec, 1, outvec, 1, 0x20) == 0);
+  //then have overlapping
+  //then have different size
   munmap(source, 4096 * 27);
   munmap(dest, 4096 * 27);
+}
+
+void testmisc() {
+  //then have remapping of previous
 }
 
 int main() {
