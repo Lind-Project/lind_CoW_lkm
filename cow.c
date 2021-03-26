@@ -83,7 +83,6 @@ typeof(&swap_duplicate) swdup;
 typeof(&cgroup_throttle_swaprate) cgts;
 typeof(&mem_cgroup_charge) mcgc;
 typeof(&do_munmap) dmm;
-spinlock_t mmll;
 
 do_or_clear_bad(pgd)
 do_or_clear_bad(p4d)
@@ -288,17 +287,11 @@ static unsigned long custom_copy_nonpresent_pte(struct mm_struct *dst_mm, struct
   pte_t pte = *src_pte;
   struct page *page;
   swp_entry_t entry = pte_to_swp_entry(pte);
-	printk(KERN_INFO "LINDLKM: copying nonpresent pte???\n");
+  printk(KERN_INFO "LINDLKM: copying nonpresent pte???\n");
 
   if(likely(!non_swap_entry(entry))) {
     if(swdup(entry) < 0)
       return entry.val;
-    if(unlikely(list_empty(&dst_mm->mmlist))) {
-      spin_lock(&mmll);
-      if(list_empty(&dst_mm->mmlist))
-        list_add(&dst_mm->mmlist, &src_mm->mmlist);
-      spin_unlock(&mmll);
-    }
     rss[MM_SWAPENTS]++;
   } else if(is_migration_entry(entry)) {
     page = migration_entry_to_page(entry);
@@ -594,8 +587,7 @@ int custom_copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct
     raw_write_seqcount_begin(&src_mm->write_protect_seq);
   }
 
-  if((ret = general_copy_pgd_range(dst_vma, src_vma, dstaddr, srcaddr, dstend, srcend)))
-    return ret;
+  ret = general_copy_pgd_range(dst_vma, src_vma, dstaddr, srcaddr, dstend, srcend);
 
   if(is_cow) {
     raw_write_seqcount_end(&src_mm->write_protect_seq);
@@ -742,8 +734,10 @@ anothervma:
       goto mpolout;
     }
     rvma->vm_flags &= ~(VM_LOCKED | VM_LOCKONFAULT);
-    if(is_vm_hugetlb_page(rvma))
+    if(is_vm_hugetlb_page(rvma)) {
+      retval = -EINVAL;
       goto mpolout; //hugetlb pages are not supported!
+    }
 
     custom_vma_link(rvma, lvma);
     vmstata(remote_task->mm, rvma->vm_flags, vma_pages(rvma));
@@ -754,13 +748,13 @@ anothervma:
       unsigned long fromuntil = minimum(localend, lvma->vm_end);
       unsigned long copyto = maximum(remotestart, rvma->vm_start);
       unsigned long tountil = minimum(remoteend, rvma->vm_end);
+      copied_count += fromuntil - copyfrom;
       retval = custom_copy_page_range(rvma, lvma, copyto, copyfrom, tountil, fromuntil);
     }
     if(rvma->vm_ops && rvma->vm_ops->open)
       rvma->vm_ops->open(rvma);
     if(retval)
       goto undoall_norvma;
-    copied_count += local_iov_kern[i].iov_len;
     ftmr(local_task->mm, lvma->vm_start, lvma->vm_end, PAGE_SHIFT, false);
 
     localstart = lvma->vm_end;
@@ -866,7 +860,6 @@ static int __init cowcall_init(void) {
   cgts = (typeof(&cgroup_throttle_swaprate)) kln("cgroup_throttle_swaprate");
   mcgc = (typeof(&mem_cgroup_charge)) kln("mem_cgroup_charge");
   dmm = (typeof(&do_munmap)) kln("do_munmap");
-  mmll = *(spinlock_t*) kln("mmlist_lock");
   printk(KERN_INFO "LINDLKM: cowcall LKM initialized\n");
   return 0;
 }
