@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
 #include <fcntl.h>
@@ -108,10 +109,77 @@ void testknownfail() {
   assert(process_vm_writev(getpid(), invec, 1, garbage, 1, 0x20) == -1);
   invec[0].iov_base = garbage;
   assert(process_vm_writev(getpid(), invec, 1, outvec, 1, 0x20) == 0);
-  //then have overlapping
-  //then have different size
+  struct iovec overvec1[2] = {{dest, 0x6000}, {dest, 0x6000}};
+  struct iovec overvec2[1] = {{source, 0x6000}};
+  assert(process_vm_writev(getpid(), overvec1, 2, overvec2, 1, 0x20) == -1);//different number of elements
+  overvec1[0].iov_base = source + 4096;
+  overvec1[1].iov_base = source - 4096;
+  assert(process_vm_writev(getpid(), overvec1, 1, overvec2, 1, 0x20) == -1);//overlapping elements
+  assert(process_vm_writev(getpid(), overvec1 + 1, 1, overvec2, 1, 0x20) == -1);//overlapping elements
+  overvec1[0].iov_base = dest;
+  overvec1[0].iov_len = 0x7000;
+  assert(process_vm_writev(getpid(), overvec1, 1, overvec2, 1, 0x20) == -1);//different sized corresponding elements
   munmap(source, 4096 * 27);
   munmap(dest, 4096 * 27);
+}
+
+void testswappressure() {
+  char* source = mmap(NULL, 4096 * 29, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  char* dest = mmap(NULL, 4096 * 29, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  struct iovec invec[1] = {{source, 0xe000}};
+  struct iovec outvec[1] = {{dest, 0xe000}};
+  strcpy(source, "Soon to be swapped away\n");
+  long memcap = 4096 * (sysconf(_SC_AVPHYS_PAGES) + 0x1000); //get available memory, expects swap larger than 16MB
+  char* v = mmap(NULL, memcap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0); //crush available memory
+  assert(v != MAP_FAILED);
+  int result = process_vm_writev(getpid(), invec, 1, outvec, 1, 0x20);
+  assert(result == 0xe000);//if not, and working as intended (i.e. no or full swapfile), it's been OOM-reaped by this point
+  assert(!strcmp(source, dest));
+  munmap(source, 4096 * 29);
+  munmap(dest, 4096 * 29);
+  munmap(v, memcap);
+}
+
+void testmultimapping() {
+  int testfile1 = open(".test1.txt", O_CREAT | O_TRUNC | O_RDWR, 0777);
+  ftruncate(testfile1, 4096 * 42);
+  //then have remapping of previous
+  char* source = mmap(NULL, 4096 * 49, PROT_READ | PROT_WRITE, MAP_SHARED, testfile1, 0);
+  char* sourcepart2 = mmap(source + 4096 * 42, 4096 * 17, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+  char* dest = mmap(NULL, 4096 * 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  struct iovec invec[1] = {{source + 33 * 4096, 4096 * 20}};
+  struct iovec outvec[1] = {{dest, 4096 * 20}};
+  char* printloc1 = source + 38 * 4096;
+  char* printloc2 = sourcepart2 + 2 * 4096;
+  char* printloc3 = sourcepart2 + 7 * 4096;
+  char* dprintloc1 = dest + 5 * 4096;
+  char* dprintloc2 = dest + 13 * 4096;
+  char* dprintloc3 = dest + 18 * 4096;
+  puts("multione");
+  strcpy(printloc1, "part of file backing now!\n");
+  strcpy(printloc2, "part of anonymous backing!\n");
+  strcpy(printloc3, "second part of anonymous backing!\n");
+
+  process_vm_writev(getpid(), invec, 1, outvec, 1, 0x20);
+
+  puts("multi2");
+  assert(!strcmp(dprintloc1, "part of file backing now!\n"));
+  assert(!strcmp(dprintloc2, "part of anonymous backing!\n"));
+  assert(!strcmp(dprintloc3, "second part of anonymous backing!\n"));
+  puts("multi3");
+  strcpy(dprintloc1, "heart of file backing now!\n");
+  assert(!strcmp(printloc1, "heart of file backing now!\n"));
+  strcpy(dprintloc2, "heart of anonymous backing!\n");
+
+  munmap(dest + 4096 * 12, 4096 * 2); //gap in mapping
+  munmap(dest + 4096 * 9, 4096); //gap in mapping
+  process_vm_writev(getpid(), invec, 1, outvec, 1, 0x20);
+  puts("multi4");
+  assert(!strcmp(printloc1, "heart of file backing now!\n"));
+  assert(!strcmp(printloc2, "heart of anonymous backing!\n"));
+  assert(!strcmp(printloc3, "second part of anonymous backing!\n"));
+
+  munmap(source, 4096 * 59);
 }
 
 void testmisc() {
@@ -119,13 +187,14 @@ void testmisc() {
 }
 
 int main() {
+  testknownfail();
+
   testfilebacked();
   testanonymous();
   teststack();
   //would've tested malloc but it's not that useful to us here as we'd only be copying part of the allocation, and probably wouldn't work as static address data would differ
   testbrk();
-  testknownfail();
-  //testswappressure
-  //test enomem????
+  testmultimapping();
+  testswappressure();
   return 0;
 }

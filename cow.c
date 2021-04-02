@@ -154,12 +154,13 @@ static int custom_find_vma_links(struct mm_struct *mm, unsigned long addr, unsig
 }
 
 
-static void custom_vma_link(struct vm_area_struct* rvma, struct vm_area_struct* lvma) {
+static void custom_vma_link(struct vm_area_struct *rvma, struct vm_area_struct *lvma, struct vm_area_struct *prev, 
+		            struct rb_node **rb_link, struct rb_node *rb_parent) {
   struct file *mapfile = rvma->vm_file;
   struct address_space *mapping = NULL;
   struct mm_struct* memm = rvma->vm_mm;
-  struct vm_area_struct *prev;
-  struct rb_node **rb_link, *rb_parent;
+
+  printk(KERN_INFO "LINDLKM:custom vma link %p %p\n", rvma, lvma);
 
   if(mapfile) {
     mapping = mapfile->f_mapping;
@@ -178,7 +179,6 @@ static void custom_vma_link(struct vm_area_struct* rvma, struct vm_area_struct* 
     i_mmap_unlock_write(mapping);
   } //__vma_link_file
 
-  custom_find_vma_links(memm, rvma->vm_start, rvma->vm_end, &prev, &rb_link, &rb_parent);
   {
     struct vm_area_struct *next;
     rvma->vm_prev =  prev;
@@ -194,19 +194,23 @@ static void custom_vma_link(struct vm_area_struct* rvma, struct vm_area_struct* 
       next->vm_prev = rvma;
   } //__vma_link_list(remote_task->mm, rvma, prev);
 
+  printk(KERN_INFO "LINDLKM:custom vma list linked\n");
+
   vmalrb(memm, rvma, rb_link, rb_parent);
 
   memm->map_count++;
+  printk(KERN_INFO "LINDLKM:map count incremented\n");
   //validate_mm(memm); //we do not validate
 }
 
 static inline int custom_munmap_vma_range(struct mm_struct *mm, unsigned long start, unsigned long len, 
                               struct vm_area_struct **pprev, struct rb_node ***link, 
-            struct rb_node **parent, struct list_head *uf) {
+                              struct rb_node **parent, struct list_head *uf) {
+  printk(KERN_INFO "LINDLKM: Unmapping from %lx to %lx\n", start, start + len);
   while(custom_find_vma_links(mm, start, start + len, pprev, link, parent)) {
-    int unmapval = dmm(mm, start, len, uf);
-    if(unmapval)
-      return unmapval;
+    printk(KERN_INFO "LINDLKM: Found thingy to unmap\n");
+    if(dmm(mm, start, len, uf))
+      return -ENOMEM;
   }
   return 0;
 }
@@ -280,7 +284,7 @@ page_copied:
   return 0;
 }
 
-static unsigned long custom_copy_nonpresent_pte(struct mm_struct *dst_mm, struct mm_struct* src_mm, 
+static unsigned long custom_copy_nonpresent_pte(struct mm_struct *dst_mm, struct mm_struct *src_mm, 
                                                 pte_t *dst_pte, pte_t *src_pte, struct vm_area_struct *vma, 
                                                 unsigned long dstaddr, unsigned long srcaddr, int* rss) {
   unsigned long vm_flags = vma->vm_flags;
@@ -679,21 +683,16 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
     unsigned long localstart = (unsigned long)local_iov_kern[i].iov_base;
     unsigned long localend = localstart + local_iov_kern[i].iov_len;
     unsigned long remotestart = (unsigned long)remote_iov_kern[i].iov_base;
-    unsigned long remoteend = remotestart + remote_iov_kern[i].iov_len;
     if(localstart == localend) continue;
 
-    printk(KERN_INFO "LINDLKM: undoingallnorvma\n");
     if((retval = custom_munmap_vma_range(remote_task->mm, (unsigned long) remotestart, remote_iov_kern[i].iov_len, &prev, &rb_link, &rb_parent, &uf)))
       goto undoall_norvma;
 
     rvma = NULL;
 anothervma:
     lvma = find_vma_intersection(local_task->mm, localstart, localend);
-    printk(KERN_INFO "LINDLKM: finding intersection\n");
-    if(!lvma) {
-      printk(KERN_INFO "LINDLKM: no lvma found %lx %lx\n", localstart, localend);
+    if(!lvma)
       continue;
-    }
 
     if(lvma->vm_flags & VM_DONTCOPY) {
       localstart = lvma->vm_end;
@@ -717,8 +716,12 @@ anothervma:
       retval = -ENOMEM;
       goto undoall_norvma;
     }
-    rvma->vm_start = (long unsigned) remote_iov_kern[i].iov_base;
-    rvma->vm_end = rvma->vm_start + remote_iov_kern[i].iov_len;
+    rvma->vm_start = maximum(lvma->vm_start - (long unsigned) local_iov_kern[i].iov_base + (long unsigned) remote_iov_kern[i].iov_base, (long unsigned) remote_iov_kern[i].iov_base);
+    rvma->vm_end = minimum(lvma->vm_end - lvma->vm_start + rvma->vm_start, rvma->vm_start + (remote_iov_kern[i].iov_len - (lvma->vm_start - (long unsigned) local_iov_kern[i].iov_base)));
+
+
+    printk(KERN_INFO "LINDLKM: start: %lx end: %lx length: %lx\n", lvma->vm_start, lvma->vm_end, lvma->vm_end - lvma->vm_start);
+    printk(KERN_INFO "LINDLKM: start: %lx end: %lx length: %lx\n", rvma->vm_start, rvma->vm_end, rvma->vm_end - rvma->vm_start);
 
     retval = vmadpol(lvma, rvma);
     if(retval) {
@@ -745,15 +748,14 @@ anothervma:
       goto mpolout; //hugetlb pages are not supported!
     }
 
-    custom_vma_link(rvma, lvma);
+    custom_vma_link(rvma, lvma, prev, rb_link, rb_parent);
     vmstata(remote_task->mm, rvma->vm_flags, vma_pages(rvma));
-
 
     if(!(rvma->vm_flags & VM_WIPEONFORK)) {
       unsigned long copyfrom = maximum(localstart,lvma->vm_start);
       unsigned long fromuntil = minimum(localend, lvma->vm_end);
-      unsigned long copyto = maximum(remotestart, rvma->vm_start);
-      unsigned long tountil = minimum(remoteend, rvma->vm_end);
+      unsigned long copyto = rvma->vm_start;
+      unsigned long tountil = rvma->vm_end;
       copied_count += fromuntil - copyfrom;
       retval = custom_copy_page_range(rvma, lvma, copyto, copyfrom, tountil, fromuntil);
     }
