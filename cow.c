@@ -52,7 +52,6 @@ ssize_t (*old_vm_writev)(const struct pt_regs*);
 typeof(&reset_vma_resv_huge_pages) rvhp;
 typeof(&anon_vma_fork) avf;
 typeof(&track_pfn_copy) tpc;
-typeof(&vma_interval_tree_insert_after) vitia;
 typeof(&vma_interval_tree_insert) viti;
 void (*ftmr)(struct mm_struct*, unsigned long, unsigned long, unsigned int, bool);//typeof didn't work
 typeof(&__p4d_alloc) p4da;
@@ -160,8 +159,6 @@ static void custom_vma_link(struct vm_area_struct *rvma, struct vm_area_struct *
   struct address_space *mapping = NULL;
   struct mm_struct* memm = rvma->vm_mm;
 
-  printk(KERN_INFO "LINDLKM:custom vma link %p %p\n", rvma, lvma);
-
   if(mapfile) {
     mapping = mapfile->f_mapping;
     i_mmap_lock_write(mapping);
@@ -173,7 +170,7 @@ static void custom_vma_link(struct vm_area_struct *rvma, struct vm_area_struct *
       mapping_allow_writable(mapping);
 
     flush_dcache_mmap_lock(mapping);
-    vitia(rvma, lvma, &mapping->i_mmap);
+    viti(rvma, &mapping->i_mmap);
     flush_dcache_mmap_unlock(mapping);
 
     i_mmap_unlock_write(mapping);
@@ -194,12 +191,9 @@ static void custom_vma_link(struct vm_area_struct *rvma, struct vm_area_struct *
       next->vm_prev = rvma;
   } //__vma_link_list(remote_task->mm, rvma, prev);
 
-  printk(KERN_INFO "LINDLKM:custom vma list linked\n");
-
   vmalrb(memm, rvma, rb_link, rb_parent);
 
   memm->map_count++;
-  printk(KERN_INFO "LINDLKM:map count incremented\n");
   //validate_mm(memm); //we do not validate
 }
 
@@ -208,7 +202,6 @@ static inline int custom_munmap_vma_range(struct mm_struct *mm, unsigned long st
                               struct rb_node **parent, struct list_head *uf) {
   printk(KERN_INFO "LINDLKM: Unmapping from %lx to %lx\n", start, start + len);
   while(custom_find_vma_links(mm, start, start + len, pprev, link, parent)) {
-    printk(KERN_INFO "LINDLKM: Found thingy to unmap\n");
     if(dmm(mm, start, len, uf))
       return -ENOMEM;
   }
@@ -718,10 +711,11 @@ anothervma:
     }
     rvma->vm_start = maximum(lvma->vm_start - (long unsigned) local_iov_kern[i].iov_base + (long unsigned) remote_iov_kern[i].iov_base, (long unsigned) remote_iov_kern[i].iov_base);
     rvma->vm_end = minimum(lvma->vm_end - lvma->vm_start + rvma->vm_start, rvma->vm_start + (remote_iov_kern[i].iov_len - (lvma->vm_start - (long unsigned) local_iov_kern[i].iov_base)));
+    rvma->vm_pgoff += (maximum((long unsigned) local_iov_kern[i].iov_base, lvma->vm_start) - lvma->vm_start) >> PAGE_SHIFT;
 
 
-    printk(KERN_INFO "LINDLKM: start: %lx end: %lx length: %lx\n", lvma->vm_start, lvma->vm_end, lvma->vm_end - lvma->vm_start);
-    printk(KERN_INFO "LINDLKM: start: %lx end: %lx length: %lx\n", rvma->vm_start, rvma->vm_end, rvma->vm_end - rvma->vm_start);
+    printk(KERN_INFO "LINDLKM: local start: %lx end: %lx length: %lx %d\n", lvma->vm_start, lvma->vm_end, lvma->vm_end - lvma->vm_start, lvma->vm_pgoff);
+    printk(KERN_INFO "LINDLKM: remote start: %lx end: %lx length: %lx %d\n", rvma->vm_start, rvma->vm_end, rvma->vm_end - rvma->vm_start, rvma->vm_pgoff);
 
     retval = vmadpol(lvma, rvma);
     if(retval) {
@@ -834,7 +828,6 @@ static int __init cowcall_init(void) {
   disable_syscall_write();
   rvhp = (typeof(&reset_vma_resv_huge_pages)) kln("reset_vma_resv_huge_pages");
   avf = (typeof(&anon_vma_fork)) kln("anon_vma_fork");
-  vitia = (typeof(&vma_interval_tree_insert_after)) kln("vma_interval_tree_insert_after");
   viti = (typeof(&vma_interval_tree_insert)) kln("vma_interval_tree_insert");
   ftmr = (void (*)(struct mm_struct*, unsigned long, unsigned long, unsigned int, bool)) kln("flush_tlb_mm_range");
   p4da = (typeof(&__p4d_alloc)) kln("__p4d_alloc");

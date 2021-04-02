@@ -142,29 +142,32 @@ void testswappressure() {
 
 void testmultimapping() {
   int testfile1 = open(".test1.txt", O_CREAT | O_TRUNC | O_RDWR, 0777);
-  ftruncate(testfile1, 4096 * 42);
+  ftruncate(testfile1, 4096 * 80);
   //then have remapping of previous
-  char* source = mmap(NULL, 4096 * 49, PROT_READ | PROT_WRITE, MAP_SHARED, testfile1, 0);
+  char* source = mmap(NULL, 4096 * 59, PROT_READ | PROT_WRITE, MAP_SHARED, testfile1, 0);
+  printf("%p\n", source);
   char* sourcepart2 = mmap(source + 4096 * 42, 4096 * 17, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
   char* dest = mmap(NULL, 4096 * 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   struct iovec invec[1] = {{source + 33 * 4096, 4096 * 20}};
   struct iovec outvec[1] = {{dest, 4096 * 20}};
   char* printloc1 = source + 38 * 4096;
-  char* printloc2 = sourcepart2 + 2 * 4096;
-  char* printloc3 = sourcepart2 + 7 * 4096;
+  char* printloc2 = source + 44 * 4096;
+  char* printloc3 = source + 49 * 4096;
   char* dprintloc1 = dest + 5 * 4096;
-  char* dprintloc2 = dest + 13 * 4096;
-  char* dprintloc3 = dest + 18 * 4096;
-  puts("multione");
+  char* dprintloc2 = dest + 11 * 4096;
+  char* dprintloc3 = dest + 16 * 4096;
   strcpy(printloc1, "part of file backing now!\n");
   strcpy(printloc2, "part of anonymous backing!\n");
   strcpy(printloc3, "second part of anonymous backing!\n");
 
-  process_vm_writev(getpid(), invec, 1, outvec, 1, 0x20);
+  printf("%d %p %d\n", process_vm_writev(getpid(), invec, 1, outvec, 1, 0x20), outvec[0].iov_base, *dprintloc1);
 
+  *(dprintloc1) = 4;
   puts("multi2");
   assert(!strcmp(dprintloc1, "part of file backing now!\n"));
+  puts("multi2");
   assert(!strcmp(dprintloc2, "part of anonymous backing!\n"));
+  puts("multi2");
   assert(!strcmp(dprintloc3, "second part of anonymous backing!\n"));
   puts("multi3");
   strcpy(dprintloc1, "heart of file backing now!\n");
