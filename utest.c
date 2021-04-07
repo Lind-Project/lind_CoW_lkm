@@ -143,9 +143,7 @@ void testswappressure() {
 void testmultimapping() {
   int testfile1 = open(".test1.txt", O_CREAT | O_TRUNC | O_RDWR, 0777);
   ftruncate(testfile1, 4096 * 80);
-  //then have remapping of previous
   char* source = mmap(NULL, 4096 * 59, PROT_READ | PROT_WRITE, MAP_SHARED, testfile1, 0);
-  printf("%p\n", source);
   char* sourcepart2 = mmap(source + 4096 * 42, 4096 * 17, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
   char* dest = mmap(NULL, 4096 * 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   struct iovec invec[1] = {{source + 33 * 4096, 4096 * 20}};
@@ -160,16 +158,11 @@ void testmultimapping() {
   strcpy(printloc2, "part of anonymous backing!\n");
   strcpy(printloc3, "second part of anonymous backing!\n");
 
-  printf("%d %p %d\n", process_vm_writev(getpid(), invec, 1, outvec, 1, 0x20), outvec[0].iov_base, *dprintloc1);
+  process_vm_writev(getpid(), invec, 1, outvec, 1, 0x20);
 
-  *(dprintloc1) = 4;
-  puts("multi2");
   assert(!strcmp(dprintloc1, "part of file backing now!\n"));
-  puts("multi2");
   assert(!strcmp(dprintloc2, "part of anonymous backing!\n"));
-  puts("multi2");
   assert(!strcmp(dprintloc3, "second part of anonymous backing!\n"));
-  puts("multi3");
   strcpy(dprintloc1, "heart of file backing now!\n");
   assert(!strcmp(printloc1, "heart of file backing now!\n"));
   strcpy(dprintloc2, "heart of anonymous backing!\n");
@@ -177,10 +170,10 @@ void testmultimapping() {
   munmap(dest + 4096 * 12, 4096 * 2); //gap in mapping
   munmap(dest + 4096 * 9, 4096); //gap in mapping
   process_vm_writev(getpid(), invec, 1, outvec, 1, 0x20);
-  puts("multi4");
   assert(!strcmp(printloc1, "heart of file backing now!\n"));
-  assert(!strcmp(printloc2, "heart of anonymous backing!\n"));
+  assert(strcmp(printloc2, "heart of anonymous backing!\n"));
   assert(!strcmp(printloc3, "second part of anonymous backing!\n"));
+  //check that the file actually changed
 
   munmap(source, 4096 * 59);
 }

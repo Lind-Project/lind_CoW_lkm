@@ -200,7 +200,6 @@ static void custom_vma_link(struct vm_area_struct *rvma, struct vm_area_struct *
 static inline int custom_munmap_vma_range(struct mm_struct *mm, unsigned long start, unsigned long len, 
                               struct vm_area_struct **pprev, struct rb_node ***link, 
                               struct rb_node **parent, struct list_head *uf) {
-  printk(KERN_INFO "LINDLKM: Unmapping from %lx to %lx\n", start, start + len);
   while(custom_find_vma_links(mm, start, start + len, pprev, link, parent)) {
     if(dmm(mm, start, len, uf))
       return -ENOMEM;
@@ -632,6 +631,11 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
   
   //validate input vectors
   remote_task = pid_task(find_vpid(pid), PIDTYPE_PID);
+  if(current != remote_task) {
+    retval = -EINVAL;
+    printk(KERN_INFO "LINDLKM: PID of remote process is not PID of calling process\n");
+    goto out;
+  }
   for(i = 0; i < liovcnt; i++) {
     if(local_iov_kern[i].iov_len != remote_iov_kern[i].iov_len) {
       retval = -EINVAL;
@@ -676,12 +680,12 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
     unsigned long localstart = (unsigned long)local_iov_kern[i].iov_base;
     unsigned long localend = localstart + local_iov_kern[i].iov_len;
     unsigned long remotestart = (unsigned long)remote_iov_kern[i].iov_base;
+    unsigned long copyto, tountil, copyfrom, fromuntil;
     if(localstart == localend) continue;
 
-    if((retval = custom_munmap_vma_range(remote_task->mm, (unsigned long) remotestart, remote_iov_kern[i].iov_len, &prev, &rb_link, &rb_parent, &uf)))
+    if((retval = custom_munmap_vma_range(local_task->mm, remotestart, remote_iov_kern[i].iov_len, &prev, &rb_link, &rb_parent, &uf)))
       goto undoall_norvma;
 
-    rvma = NULL;
 anothervma:
     lvma = find_vma_intersection(local_task->mm, localstart, localend);
     if(!lvma)
@@ -709,13 +713,9 @@ anothervma:
       retval = -ENOMEM;
       goto undoall_norvma;
     }
-    rvma->vm_start = maximum(lvma->vm_start - (long unsigned) local_iov_kern[i].iov_base + (long unsigned) remote_iov_kern[i].iov_base, (long unsigned) remote_iov_kern[i].iov_base);
-    rvma->vm_end = minimum(lvma->vm_end - lvma->vm_start + rvma->vm_start, rvma->vm_start + (remote_iov_kern[i].iov_len - (lvma->vm_start - (long unsigned) local_iov_kern[i].iov_base)));
+    rvma->vm_start = maximum(lvma->vm_start - (long unsigned) local_iov_kern[i].iov_base + (long unsigned) remote_iov_kern[i].iov_base, (long unsigned) remotestart);
+    rvma->vm_end = rvma->vm_start + minimum(lvma->vm_end - maximum(lvma->vm_start, (long unsigned) local_iov_kern[i].iov_base),                                             remote_iov_kern[i].iov_len - maximum(0, rvma->vm_start - remotestart));
     rvma->vm_pgoff += (maximum((long unsigned) local_iov_kern[i].iov_base, lvma->vm_start) - lvma->vm_start) >> PAGE_SHIFT;
-
-
-    printk(KERN_INFO "LINDLKM: local start: %lx end: %lx length: %lx %d\n", lvma->vm_start, lvma->vm_end, lvma->vm_end - lvma->vm_start, lvma->vm_pgoff);
-    printk(KERN_INFO "LINDLKM: remote start: %lx end: %lx length: %lx %d\n", rvma->vm_start, rvma->vm_end, rvma->vm_end - rvma->vm_start, rvma->vm_pgoff);
 
     retval = vmadpol(lvma, rvma);
     if(retval) {
@@ -745,23 +745,29 @@ anothervma:
     custom_vma_link(rvma, lvma, prev, rb_link, rb_parent);
     vmstata(remote_task->mm, rvma->vm_flags, vma_pages(rvma));
 
+    copyto = rvma->vm_start;
+    tountil = rvma->vm_end;
+    copyfrom = maximum(localstart,lvma->vm_start);
+    fromuntil = copyfrom + (tountil - copyto);
     if(!(rvma->vm_flags & VM_WIPEONFORK)) {
-      unsigned long copyfrom = maximum(localstart,lvma->vm_start);
-      unsigned long fromuntil = minimum(localend, lvma->vm_end);
-      unsigned long copyto = rvma->vm_start;
-      unsigned long tountil = rvma->vm_end;
-      copied_count += fromuntil - copyfrom;
+      copied_count += tountil - copyto;
       retval = custom_copy_page_range(rvma, lvma, copyto, copyfrom, tountil, fromuntil);
     }
     if(rvma->vm_ops && rvma->vm_ops->open)
       rvma->vm_ops->open(rvma);
     if(retval)
       goto undoall_norvma;
-    ftmr(local_task->mm, lvma->vm_start, lvma->vm_end, PAGE_SHIFT, false);
+    ftmr(local_task->mm, copyfrom, fromuntil, PAGE_SHIFT, false);
 
-    localstart = lvma->vm_end;
-    if(localstart < localend)
+    if(localstart < localend) {
+      unsigned long linkbegin;
+      unsigned long linkend;
+      localstart = lvma->vm_end;
+      linkbegin = remotestart + localstart - (unsigned long) local_iov_kern[i].iov_base;
+      linkend = remotestart + local_iov_kern[i].iov_len;
+      custom_find_vma_links(local_task->mm, linkbegin, linkend, &prev, &rb_link, &rb_parent);
       goto anothervma;
+    }
   }
   mmap_write_unlock(remote_task->mm);
   dufdc(&uf);
