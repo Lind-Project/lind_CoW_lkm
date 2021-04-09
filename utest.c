@@ -1,3 +1,6 @@
+#ifndef TESTSWAP
+#define TESTSWAP 0
+#endif
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -83,9 +86,10 @@ void teststack() {
 void testbrk() {
   char* brkpage = sbrk(20480);
   strcpy(brkpage, "This is most definitely break memory");
-  struct iovec invec[1] = {{brkpage, 0x3000}};
+  struct iovec invec[2] = {{brkpage, 0x3000}, {brkpage, 0x3000}};
   char* dest = mmap(NULL, 12288, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  struct iovec outvec[1] = {{dest, 0x3000}};
+  struct iovec outvec[2] = {{dest, 0x3000}, {dest, 0x3000}};
+  //same region twice so as to test unmapping properly
 
   assert(process_vm_writev(getpid(), invec, 1, outvec, 1, 0x20) == 0x3000);
   assert(!strcmp((char*) dest, "This is most definitely break memory"));
@@ -101,6 +105,7 @@ void testknownfail() {
   struct iovec invec[1] = {{source, 0xe000}};
   struct iovec outvec[1] = {{dest, 0xe000}};
   assert(process_vm_writev(getpid(), invec, 1, outvec, 1, 0x20) == 0xE000);
+  assert(process_vm_writev(888, invec, 1, outvec, 1, 0x20) == -1);
   struct iovec firstpagevec[1] = {{0, 0xe000}};
   assert(process_vm_writev(getpid(), firstpagevec, 1, outvec, 1, 0x20) == -1);
   assert(process_vm_writev(getpid(), invec, 1, firstpagevec, 1, 0x20) == -1);
@@ -129,7 +134,7 @@ void testswappressure() {
   struct iovec invec[1] = {{source, 0xe000}};
   struct iovec outvec[1] = {{dest, 0xe000}};
   strcpy(source, "Soon to be swapped away\n");
-  long memcap = 4096 * (sysconf(_SC_AVPHYS_PAGES) + 0x1000); //get available memory, expects swap larger than 16MB
+  long memcap = 4096 * (sysconf(_SC_PHYS_PAGES) + 0x1000); //get available memory, expects swap larger than 16MB + current memory in use
   char* v = mmap(NULL, memcap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0); //crush available memory
   assert(v != MAP_FAILED);
   int result = process_vm_writev(getpid(), invec, 1, outvec, 1, 0x20);
@@ -174,12 +179,11 @@ void testmultimapping() {
   assert(strcmp(printloc2, "heart of anonymous backing!\n"));
   assert(!strcmp(printloc3, "second part of anonymous backing!\n"));
   //check that the file actually changed
+  char strbuf[30];
+  assert(pread(testfile1, strbuf, 30, printloc1 - source));
+  assert(!strcmp(strbuf, "heart of file backing now!\n"));
 
   munmap(source, 4096 * 59);
-}
-
-void testmisc() {
-  //then have remapping of previous
 }
 
 int main() {
@@ -191,6 +195,8 @@ int main() {
   //would've tested malloc but it's not that useful to us here as we'd only be copying part of the allocation, and probably wouldn't work as static address data would differ
   testbrk();
   testmultimapping();
+#if defined(TESTSWAP) && TESTSWAP == 1
   testswappressure();
+#endif
   return 0;
 }

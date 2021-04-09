@@ -283,7 +283,6 @@ static unsigned long custom_copy_nonpresent_pte(struct mm_struct *dst_mm, struct
   pte_t pte = *src_pte;
   struct page *page;
   swp_entry_t entry = pte_to_swp_entry(pte);
-  printk(KERN_INFO "LINDLKM: copying nonpresent pte???\n");
 
   if(likely(!non_swap_entry(entry))) {
     if(swdup(entry) < 0)
@@ -663,9 +662,9 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
     }
     if((unsigned long) remote_iov_kern[i].iov_base <= (unsigned long) local_iov_kern[i].iov_base) {
       if((unsigned long) remote_iov_kern[i].iov_base + remote_iov_kern[i].iov_len > (unsigned long) local_iov_kern[i].iov_base) {
-      retval = -EINVAL;
-      printk(KERN_INFO "LINDLKM: error in iovecs input, corresponding mappings overlap\n");
-      goto out;
+        retval = -EINVAL;
+        printk(KERN_INFO "LINDLKM: error in iovecs input, corresponding mappings overlap\n");
+        goto out;
       }
     } else if((unsigned long) local_iov_kern[i].iov_base + local_iov_kern[i].iov_len > (unsigned long) remote_iov_kern[i].iov_base) {
       retval = -EINVAL;
@@ -794,7 +793,7 @@ out:
 
 ssize_t intercept_process_vm_writev(const struct pt_regs *regs) {
   if(regs->r9 & 0x20) {
-    printk(KERN_INFO "LINDLKM: intercepted and skipping vm writev");
+    printk(KERN_INFO "LINDLKM: intercepted vm writev, will CoW");
     return process_vm_cowv(regs);
   } else {
     return old_vm_writev(regs);
