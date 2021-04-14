@@ -25,7 +25,7 @@ stest: utest.c all
 	 ./ustest
 
 fuzz: fuzz.c all
-	 gcc fuzz.c -o fuzz
+	 gcc fuzz.c -o fuzz -lm
 	 -rmmod cow.ko 
 	 insmod cow.ko
 	 ./fuzz

@@ -7,22 +7,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <math.h>
 #define minimum(x, y) ((x) < (y) ? (x) : (y))
 #define maximum(x, y) ((x) > (y) ? (x) : (y))
 #define MAXMAPSIZE (2200 * 4096)
 #define MAXMAPPINGCNT 200
+#define COUNTPOKES (2000)
 #define randaddr(start, end) (((random() % (unsigned long) (end - start)) + (unsigned long) start) & ~0xfff)
 #define randaddrlen(addr, end) ((random() % minimum((unsigned long)(end - (addr)), MAXMAPSIZE)) & ~0xfff)
 char tmp[] = "fuzzXXXXXX";
 #define randlong() ((random() << 31) + random()) 
 //top 2 bits still not filled, I'm fine with this
 
-void* randomapping(void* startaddr, void* endaddr) {
-  unsigned long mapaddr = randaddr(startaddr, endaddr);
-  unsigned long maplen = randaddrlen(mapaddr, endaddr);
-  int file = -1;
-  void* mapping;
+int frandmap(void* addr, unsigned int len) {
   unsigned long randbits = randlong();
+  int file = -1;
 
   int flags = MAP_FIXED;
   int prot = 0;
@@ -38,37 +37,44 @@ void* randomapping(void* startaddr, void* endaddr) {
 
   if(randbits & 1) {
     file = mkstemp(tmp);
-    ftruncate(file, maplen + 40960);
+    ftruncate(file, len + 40960);
     int offset = random() % 10;
     if(randbits & 2) {
-      mapping = mmap((void*) mapaddr, maplen, prot, MAP_PRIVATE | flags, file, offset * 4096);
+      mmap(addr, len, prot, MAP_PRIVATE | flags, file, offset * 4096);
     } else {
-      mapping = mmap((void*) mapaddr, maplen, prot, MAP_SHARED | flags, file, offset * 4096);
+      mmap(addr, len, prot, MAP_SHARED | flags, file, offset * 4096);
     }
   } else {
     //private & anonymous
     if(randbits & 2) {
-      mapping = mmap((void*) mapaddr, maplen, prot, MAP_PRIVATE | MAP_ANONYMOUS | flags, -1, 0);
+      mmap(addr, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | flags, -1, 0);
       if(randbits & 64) {
-        madvise(mapping, maplen, MADV_WIPEONFORK);
+        madvise(addr, len, MADV_WIPEONFORK);
 	//can only be applid to private anonymous
       }
     } else {
-      mapping = mmap((void*) mapaddr, maplen, prot, MAP_SHARED | MAP_ANONYMOUS | flags, -1, 0);
+      mmap(addr, len, prot, MAP_SHARED | MAP_ANONYMOUS | flags, -1, 0);
     }
   }
 
-  if(randbits & 16 && maplen < 0xff000) {
-    mlock(mapping, maplen);
+  if(randbits & 16 && len < 0xff000) {
+    mlock(addr, len);
   }
   if(randbits & 32) {
-    madvise(mapping, maplen, MADV_DONTFORK);
+    madvise(addr, len, MADV_DONTFORK);
   }
   if(file != -1) {
     close(file);
     unlink(tmp);
     for(int i = 4; i < 10; i++) tmp[i] = 'X';
   }
+  return prot;
+}
+
+void randomapping(void* startaddr, void* endaddr) {
+  unsigned long mapaddr = randaddr(startaddr, endaddr);
+  unsigned long maplen = randaddrlen(mapaddr, endaddr);
+  frandmap((void*) mapaddr, maplen);
 }
 
  int performfuzz() {
@@ -93,10 +99,10 @@ void* randomapping(void* startaddr, void* endaddr) {
     destendaddr = endaddr;
   } else {
     deststartaddr = (void*) (randlong() & 0xffffffff000);
-    if(random() & 3 != 3) {
-      destendaddr = (void*) (randlong() & 0xffffffff000);
-    } else {
+    if(random() & 3 == 3) {
       destendaddr = deststartaddr + MAXMAPSIZE;
+    } else {
+      destendaddr = (void*) (randlong() & 0xffffffff000);
     }
     if(deststartaddr > destendaddr) {
       void* tmp = deststartaddr;
@@ -115,8 +121,11 @@ void* randomapping(void* startaddr, void* endaddr) {
     do {
       srcbase = (void*) (randaddr(startaddr, endaddr));
       dstbase = (void*) (randaddr(deststartaddr, destendaddr));
-      length = minimum(randaddrlen(srcbase, endaddr), randaddrlen(dstbase, destendaddr));
+      unsigned long len1 = randaddrlen(srcbase, endaddr);
+      unsigned long len2 = randaddrlen(dstbase, destendaddr);
+      length = minimum(len1, len2);
     } while((srcbase < dstbase && (srcbase + length) > dstbase) || (dstbase < srcbase && (dstbase + length) > srcbase));
+    printf("%p %p %lx\n", srcbase, dstbase, length);
     srcvec[_].iov_base = srcbase;
     dstvec[_].iov_base = dstbase;
     srcvec[_].iov_len = length;
@@ -128,7 +137,26 @@ void* randomapping(void* startaddr, void* endaddr) {
     randomapping(deststartaddr, destendaddr);
   }
  
-  return process_vm_writev(getpid(), srcvec, vecelems, dstvec, vecelems, 0x20);
+  long step = (destendaddr - deststartaddr) / 4096 / COUNTPOKES;
+  if(step == 0) step = 1;
+
+  void* addr = deststartaddr;
+  while(addr < (void*) destendaddr) {
+    if(random() & 7) getrandom(addr + (random() % (4096 * 3)), random() % (4096 * ((random() & 15) + 1)), 0);
+    //we use getrandom because it'll just EFAULT rather than seg fault if we have no write perms
+
+    float rand01a = (float) random() / (RAND_MAX / 1.0);
+    float rand01b = (float) random() / (RAND_MAX / 1.0);
+    float normaldist = sqrt(-2 * log(rand01a)) * cos(2 * M_PI * rand01b);
+    float betterstep = normaldist * step;
+    if(betterstep < 1.0) betterstep = 1.0;
+    addr += 4096 * (int) betterstep;
+  }
+
+  int result = process_vm_writev(getpid(), srcvec, vecelems, dstvec, vecelems, 0x20);
+
+
+  return result;
 }
 
 int main(int argc, char** argv) {
@@ -142,7 +170,10 @@ int main(int argc, char** argv) {
     srandom(seed);
   }
   dprintf(seedlog, "0x%lx\n", seed);
-  int retcode = performfuzz();
-  printf("seed: 0x%lx, return code %d\n", seed, retcode);
+  int retcode;
+  for(int i = 0; i < 100; i++) {
+    retcode = performfuzz();
+    printf("seed: 0x%lx, return code %d\n", seed, retcode);
+  }
   return retcode;
 }
