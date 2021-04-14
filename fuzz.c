@@ -19,6 +19,8 @@ char tmp[] = "fuzzXXXXXX";
 #define randlong() ((random() << 31) + random()) 
 //top 2 bits still not filled, I'm fine with this
 
+//generate a mapping with random characteristics that could affct fork
+//these include prot, certain flags, and certain madvise values
 int frandmap(void* addr, unsigned int len) {
   unsigned long randbits = randlong();
   int file = -1;
@@ -50,7 +52,7 @@ int frandmap(void* addr, unsigned int len) {
       mmap(addr, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | flags, -1, 0);
       if(randbits & 64) {
         madvise(addr, len, MADV_WIPEONFORK);
-	//can only be applid to private anonymous
+	//can only be applied to private anonymous mappings
       }
     } else {
       mmap(addr, len, prot, MAP_SHARED | MAP_ANONYMOUS | flags, -1, 0);
@@ -83,6 +85,7 @@ void randomapping(void* startaddr, void* endaddr) {
   void* deststartaddr;
   void* destendaddr;
   long diff, destdiff;
+  //randomize addresses for source and destination of mappings, making sure we sometimes test overlap
   startaddr = (void*) (randlong() & 0xffffffff000);
   if(random() & 3 != 3) {
     endaddr = (void*) (randlong() & 0xffffffff000);
@@ -111,6 +114,7 @@ void randomapping(void* startaddr, void* endaddr) {
     }
   }
  
+  //randomize iovec elements
   struct iovec srcvec[1024];
   struct iovec dstvec[1024];
   int vecelems = random() % 1024;
@@ -132,22 +136,29 @@ void randomapping(void* startaddr, void* endaddr) {
     dstvec[_].iov_len = length;
   }
  
+  //generate random mappings to copy from in source, and to overwrite in dest
   for(int _ = 0; _ < (random() % MAXMAPPINGCNT); _++) {
     randomapping(startaddr, endaddr);
     randomapping(deststartaddr, destendaddr);
   }
  
+  //average step between pages to go
   long step = (destendaddr - deststartaddr) / 4096 / COUNTPOKES;
   if(step == 0) step = 1;
 
   void* addr = deststartaddr;
   while(addr < (void*) destendaddr) {
-    if(random() & 7) getrandom(addr + (random() % (4096 * 3)), random() % (4096 * ((random() & 15) + 1)), 0);
+    //poke at random address range somewhere near addr
+    if(random() & 7) getrandom(addr + (random() % (4096 * 3)), random() % (4096 * ((random() & 3) + 1)), 0);
     //we use getrandom because it'll just EFAULT rather than seg fault if we have no write perms
 
+    //generate a random number in a normal distribution
     float rand01a = (float) random() / (RAND_MAX / 1.0);
     float rand01b = (float) random() / (RAND_MAX / 1.0);
-    float normaldist = sqrt(-2 * log(rand01a)) * cos(2 * M_PI * rand01b);
+    float normaldist = sqrt(-2 * log(rand01a)) * cos(2 * M_PI * rand01b) + 1.0;
+
+    //multiply our step by the random variable in the normal distribuion (of course clamping below by 1)
+    //we do this in order to test many mappings but sometimes skip larger swaths in order to test that case as well
     float betterstep = normaldist * step;
     if(betterstep < 1.0) betterstep = 1.0;
     addr += 4096 * (int) betterstep;
@@ -170,10 +181,11 @@ int main(int argc, char** argv) {
     srandom(seed);
   }
   dprintf(seedlog, "0x%lx\n", seed);
+  //seeding for reproducibility
   int retcode;
   for(int i = 0; i < 100; i++) {
     retcode = performfuzz();
-    printf("seed: 0x%lx, return code %d\n", seed, retcode);
+    printf("return code %d\n", seed, retcode);
   }
   return retcode;
 }
