@@ -18,6 +18,8 @@
 char tmp[] = "fuzzXXXXXX";
 #define randlong() ((random() << 31) + random()) 
 //top 2 bits still not filled, I'm fine with this
+#define xorb() (randlong() & randlong() & randlong() & randlong() & randlong())
+//one in 32 change of each bit being set
 
 //generate a mapping with random characteristics that could affct fork
 //these include prot, certain flags, and certain madvise values
@@ -146,6 +148,33 @@ void randomapping(void* startaddr, void* endaddr) {
   long step = (destendaddr - deststartaddr) / 4096 / COUNTPOKES;
   if(step == 0) step = 1;
 
+  int result;
+  //more traditional bit fiddling for fuzzing
+  switch(random() & 0xf) {
+    default:
+      result = process_vm_writev(getpid(), srcvec, vecelems, dstvec, vecelems, 0x20);
+      break;
+    case 0:
+      result = process_vm_writev(getpid() ^ xorb(), srcvec, vecelems, dstvec, vecelems, 0x20);
+      break;
+    case 1:
+      result = process_vm_writev(getpid(), (struct iovec*) ((unsigned long) srcvec ^ xorb()), vecelems, dstvec, vecelems, 0x20);
+      break;
+    case 2:
+      result = process_vm_writev(getpid(), srcvec, vecelems ^ xorb(), dstvec, vecelems, 0x20);
+      break;
+    case 3:
+      result = process_vm_writev(getpid(), srcvec, vecelems, (struct iovec*) ((unsigned long) dstvec ^ xorb()), vecelems, 0x20);
+      break;
+    case 4:
+      result = process_vm_writev(getpid(), srcvec, vecelems, dstvec, vecelems ^ xorb(), 0x20);
+      break;
+    case 5:
+      result = process_vm_writev(getpid(), srcvec, vecelems, dstvec, vecelems, 0x20 ^ xorb());
+      break;
+
+  }
+
   void* addr = deststartaddr;
   while(addr < (void*) destendaddr) {
     //poke at random address range somewhere near addr
@@ -164,7 +193,6 @@ void randomapping(void* startaddr, void* endaddr) {
     addr += 4096 * (int) betterstep;
   }
 
-  int result = process_vm_writev(getpid(), srcvec, vecelems, dstvec, vecelems, 0x20);
 
 
   return result;
