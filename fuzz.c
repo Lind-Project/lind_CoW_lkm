@@ -18,7 +18,8 @@
 char tmp[] = "fuzzXXXXXX";
 #define randlong() ((random() << 31) + random()) 
 //top 2 bits still not filled, I'm fine with this
-#define xorb() (randlong() & randlong() & randlong() & randlong() & randlong())
+#define randlongfull() (((random() << 31) + random()) + random() << 62)
+#define xorb() (randlongfull() & randlongfull() & randlongfull() & randlongfull() & randlongfull())
 //one in 32 change of each bit being set
 
 //generate a mapping with random characteristics that could affct fork
@@ -81,7 +82,7 @@ void randomapping(void* startaddr, void* endaddr) {
   frandmap((void*) mapaddr, maplen);
 }
 
- int performfuzz() {
+int performfuzz() {
   void* startaddr;
   void* endaddr;
   void* deststartaddr;
@@ -144,7 +145,7 @@ void randomapping(void* startaddr, void* endaddr) {
     randomapping(deststartaddr, destendaddr);
   }
  
-  //average step between pages to go
+  //reasonable step between pages (to increment addr by each iteration)
   long step = (destendaddr - deststartaddr) / 4096 / COUNTPOKES;
   if(step == 0) step = 1;
 
@@ -172,7 +173,6 @@ void randomapping(void* startaddr, void* endaddr) {
     case 5:
       result = process_vm_writev(getpid(), srcvec, vecelems, dstvec, vecelems, 0x20 ^ xorb());
       break;
-
   }
 
   void* addr = deststartaddr;
@@ -192,8 +192,6 @@ void randomapping(void* startaddr, void* endaddr) {
     if(betterstep < 1.0) betterstep = 1.0;
     addr += 4096 * (int) betterstep;
   }
-
-
 
   return result;
 }
