@@ -96,15 +96,11 @@ static int __kprobes pre0(struct kprobe *p, struct pt_regs *regs) {
 static int __kprobes pre1(struct kprobe *p, struct pt_regs *regs) {
   return 0;
 }
-static void do_register_kprobe(struct kprobe *kp, char *symbol_name, void* handler) {
-  kp->symbol_name = symbol_name;
-  kp->pre_handler = handler;
-  register_kprobe(kp);
-}
 static void lookup_lookup_name(void) {
-  struct kprobe kp0, kp1;
-  do_register_kprobe(&kp0, "kallsyms_lookup_name", pre0);
-  do_register_kprobe(&kp1, "kallsyms_lookup_name", pre1);
+  struct kprobe kp0 = {.symbol_name = "kallsyms_lookup_name", .pre_handler = pre0};
+  struct kprobe kp1 = {.symbol_name = "kallsyms_lookup_name", .pre_handler = pre1};
+  register_kprobe(&kp0);
+  register_kprobe(&kp1);
   unregister_kprobe(&kp0);
   unregister_kprobe(&kp1);
   kln = (unsigned long(*)(const char*))klnaddr;
