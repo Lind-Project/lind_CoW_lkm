@@ -185,7 +185,7 @@ static void custom_vma_link(struct vm_area_struct *rvma, struct vm_area_struct *
     rvma->vm_next = next;
     if(next)
       next->vm_prev = rvma;
-  } //__vma_link_list(remote_task->mm, rvma, prev);
+  } //__vma_link_list(current->mm, rvma, prev);
 
   vmalrb(memm, rvma, rb_link, rb_parent);
 
@@ -600,7 +600,6 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
   struct iovec *remote_iov_kern = kmalloc(sizeof(struct iovec) * riovcnt, GFP_KERNEL);
   pid_t pid = regs->di;
   struct task_struct* local_task = current;
-  struct task_struct* remote_task;
 
   ssize_t copied_count = 0;
   int retval;
@@ -624,13 +623,16 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
     goto out;
   }
   
-  //validate input vectors
-  remote_task = pid_task(find_vpid(pid), PIDTYPE_PID);
-  if(current != remote_task) {
+  //First let's confirm that the pid is actually the current pid!
+  //To do this we check what pid the current task has within its namespace and 
+  //check that against the provided pid!
+  if(task_tgid_vnr(current) != pid) {
     retval = -EINVAL;
-    printk(KERN_INFO "LINDLKM: PID of remote process is not PID of calling process\n");
+    printk(KERN_INFO "LINDLKM: PID %d (vpid) of remote process is not PID %d (vpid) of calling process\n", task_tgid_vnr(current), pid);
     goto out;
   }
+
+  //validate input vectors
   for(i = 0; i < liovcnt; i++) {
     if(local_iov_kern[i].iov_len != remote_iov_kern[i].iov_len) {
       retval = -EINVAL;
@@ -669,7 +671,7 @@ ssize_t process_vm_cowv(const struct pt_regs *regs) {
     }
   }
 
-  mmap_write_lock(remote_task->mm);
+  mmap_write_lock(current->mm);
   //perform copy, finding vmas in the range and copying them accordingly
   for(i = 0; i < liovcnt; i++) {
     unsigned long localstart = (unsigned long)local_iov_kern[i].iov_base;
@@ -717,7 +719,7 @@ anothervma:
       retval = -ENOMEM;
       goto undoall;
     }
-    rvma->vm_mm = remote_task->mm;
+    rvma->vm_mm = current->mm;
 
     retval = dufd(rvma, &uf);
     if(retval) {
@@ -738,7 +740,7 @@ anothervma:
     }
 
     custom_vma_link(rvma, lvma, prev, rb_link, rb_parent);
-    vmstata(remote_task->mm, rvma->vm_flags, vma_pages(rvma));
+    vmstata(current->mm, rvma->vm_flags, vma_pages(rvma));
 
     copyto = rvma->vm_start;
     tountil = rvma->vm_end;
@@ -764,7 +766,7 @@ anothervma:
       goto anothervma;
     }
   }
-  mmap_write_unlock(remote_task->mm);
+  mmap_write_unlock(current->mm);
   dufdc(&uf);
   kfree(local_iov_kern);
   kfree(remote_iov_kern);
@@ -776,11 +778,11 @@ undoall:
 undoall_norvma:
   printk(KERN_INFO "LINDLKM: error %d in page allocation, bailing out\n", retval);
   for(i = 0; i < liovcnt; i++) {
-    custom_munmap_vma_range(remote_task->mm, (unsigned long) remote_iov_kern[i].iov_base, 
+    custom_munmap_vma_range(current->mm, (unsigned long) remote_iov_kern[i].iov_base, 
                             remote_iov_kern[i].iov_len, &prev, &rb_link, &rb_parent, &uf);
     //failure happens transparently
   }
-  mmap_write_unlock(remote_task->mm);
+  mmap_write_unlock(current->mm);
 out:
   kfree(local_iov_kern);
   kfree(remote_iov_kern);

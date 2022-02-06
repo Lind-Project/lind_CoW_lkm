@@ -132,7 +132,7 @@ int performfuzz() {
       unsigned long len2 = randaddrlen(dstbase, destendaddr);
       length = minimum(len1, len2);
     } while((srcbase < dstbase && (srcbase + length) > dstbase) || (dstbase < srcbase && (dstbase + length) > srcbase));
-    printf("%p %p %lx\n", srcbase, dstbase, length);
+    //printf("%p %p %lx\n", srcbase, dstbase, length);
     srcvec[_].iov_base = srcbase;
     dstvec[_].iov_base = dstbase;
     srcvec[_].iov_len = length;
@@ -208,10 +208,7 @@ int main(int argc, char** argv) {
   }
   dprintf(seedlog, "0x%lx\n", seed);
   //seeding for reproducibility
-  int retcode;
-  for(int i = 0; i < 100; i++) {
-    retcode = performfuzz();
-    printf("return code %d\n", seed, retcode);
-  }
+  int retcode = performfuzz();
+  printf("return code for seed 0x%lx is %d\n", seed, retcode);
   return retcode;
 }
